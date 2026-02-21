@@ -1,0 +1,16 @@
+{
+  "views": {
+    "ALL": {
+      "panes": 14,
+      "virtual": false,
+      "assign": [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, null, null]
+    },
+    "ALL-VIRT": {
+      "panes": 6,
+      "virtual": true,
+      "active_channels": 14,
+      "start": 0,
+      "assign": [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, null, null]
+    }
+  }
+}
