@@ -8,6 +8,7 @@ import platform
 import threading
 import configparser
 import importlib.metadata
+from collections import deque
 
 import vlc
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
@@ -65,6 +66,7 @@ def clamp_int(v, lo, hi, default):
 
 class RtspConfig:
     def __init__(self, ini_path: str = "rtsp.ini"):
+        # allow ';' in password without inline comment parsing
         cp = configparser.RawConfigParser(inline_comment_prefixes=())
         ok = cp.read(ini_path, encoding="utf-8")
         if not ok:
@@ -157,6 +159,7 @@ class FullScreenWindow(QMainWindow):
         self.video = ClickableFrame(self)
         self.video.setStyleSheet("background: black;")
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # close AFTER event handler returns (prevents "wrapped C/C++ object deleted" crash)
         self.video.clicked.connect(lambda: QTimer.singleShot(0, self.close))
         v.addWidget(self.video, 1)
 
@@ -217,7 +220,7 @@ class PlayerPane(QWidget):
         self.pane_id = pane_id
         self.vlc = vlc_instance
         self.cfg = cfg
-        self.on_pane_click = on_pane_click  # callback(pane_id, is_double)
+        self.on_pane_click = on_pane_click  # callback(pane_widget, is_double)
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -226,8 +229,8 @@ class PlayerPane(QWidget):
         self.frame.setStyleSheet("background: black; border: 3px solid #333;")
         self.frame.setMinimumSize(160, 120)
         self.frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.frame.clicked.connect(lambda: self.on_pane_click(self.pane_id, False))
-        self.frame.doubleClicked.connect(lambda: self.on_pane_click(self.pane_id, True))
+        self.frame.clicked.connect(lambda: self.on_pane_click(self, False))
+        self.frame.doubleClicked.connect(lambda: self.on_pane_click(self, True))
 
         self.label = QLabel(f"Pane {pane_id}: Idle", self)
         self.label.setStyleSheet("color: #ddd;")
@@ -410,11 +413,11 @@ class PlayerPane(QWidget):
 
 
 class AboutDialog(QDialog):
-    def __init__(self, parent, cfg: RtspConfig, panes: int, virt: bool, active_count: int,
-                 start: int, rows: int, cols: int, active_list: list):
+    def __init__(self, parent, cfg: RtspConfig, panes: int, virt: bool,
+                 active_count: int, viewport_col: int, rows: int, cols: int, active_list: list):
         super().__init__(parent)
         self.setWindowTitle(f"About {APP_NAME}")
-        self.resize(780, 560)
+        self.resize(820, 600)
 
         text = QTextEdit(self)
         text.setReadOnly(True)
@@ -441,6 +444,8 @@ class AboutDialog(QDialog):
         if len(alist) > 16:
             alist = alist[:16]
 
+        total_cols = int(math.ceil(max(1, active_count) / max(1, rows)))
+
         info = []
         info.append(f"App: {APP_NAME}")
         info.append(f"OS: {platform.platform()}")
@@ -456,14 +461,15 @@ class AboutDialog(QDialog):
         info.append(f"network_caching_ms: {cfg.network_caching_ms}")
         info.append(f"open_timeout_ms: {cfg.open_timeout_ms}")
         info.append("")
-        info.append(f"Displayed tiles: {panes}  (grid {rows}x{cols})")
+        info.append(f"Displayed tiles: {panes} (grid {rows}x{cols})")
         info.append(f"Virtual mode: {virt}")
         info.append(f"Active channels count: {active_count}")
-        info.append(f"Viewport start (0-based): {start}")
-        info.append(f"Active list: {alist}")
+        info.append(f"Virtual matrix: {total_cols} columns x {rows} rows")
+        info.append(f"Viewport column (0-based): {viewport_col}")
+        info.append(f"Active list (from view assign): {alist}")
         info.append("")
         info.append("Files:")
-        info.append(f"  rtsp.ini")
+        info.append("  rtsp.ini")
         info.append(f"  {cfg.views_file}")
         info.append(f"  {cfg.state_file}")
 
@@ -502,17 +508,28 @@ class MainWindow(QMainWindow):
         vlc_args.append(f"--network-caching={self.cfg.network_caching_ms}")
         self.vlc = vlc.Instance(vlc_args)
 
+        # virtual mode state
         self.virtual_mode = False
-        self.active_channels = 16
-        self.viewport_start = 0
-        self.active_list = list(range(1, 17))
+        self.active_channels = 16               # how many active channels from active_list to use
+        self.active_list = list(range(1, 17))   # ordered list of active channels
+        self.viewport_col = 0                   # leftmost visible column in virtual matrix
 
+        # grid state
+        self.visible_panes = clamp_int(self.cfg.default_panes, 1, 16, 4)
         self.grid_rows = 2
         self.grid_cols = 2
 
-        self.fullscreen = None
-        self.fullscreen_ctx = None
+        # persistent virtual columns (each column has `grid_rows` PlayerPane)
+        self.virtual_cols = deque()
 
+        # focus (widget reference; robust when panes move)
+        self.active_pane_widget = None
+
+        # fullscreen
+        self.fullscreen = None
+        self.fullscreen_pane = None
+
+        # ui
         self.setWindowTitle(APP_NAME)
         self.resize(1600, 1000)
         self._init_menu()
@@ -523,6 +540,7 @@ class MainWindow(QMainWindow):
         main.setContentsMargins(8, 8, 8, 8)
         main.setSpacing(8)
 
+        # channel buttons 1..16
         self.btn_channels = QButtonGroup(self)
         self.btn_channels.setExclusive(False)
         grid_btn = QGridLayout()
@@ -536,6 +554,7 @@ class MainWindow(QMainWindow):
             grid_btn.addWidget(b, i // 8, i % 8)
         main.addLayout(grid_btn)
 
+        # controls row
         controls = QHBoxLayout()
         controls.setSpacing(10)
 
@@ -576,46 +595,49 @@ class MainWindow(QMainWindow):
 
         main.addLayout(controls)
 
+        # status
         self.info = QLabel("", self)
         self.info.setStyleSheet("color: #ddd;")
         main.addWidget(self.info)
 
+        # panes grid
         self.panes_grid = QGridLayout()
         self.panes_grid.setSpacing(8)
         main.addLayout(self.panes_grid, 1)
 
+        # create all panes
         self.panes = []
         for pid in range(1, 17):
             pane = PlayerPane(pid, self.vlc, self.cfg, self.on_pane_clicked)
             self.panes.append(pane)
 
-        self.active_pane = 1
-        self.visible_panes = clamp_int(self.cfg.default_panes, 1, 16, 4)
-
+        # restore state
         self._reload_views_combo()
         self._restore_state()
 
+        # wiring
         self.btn_channels.buttonClicked[int].connect(self.on_channel_pressed)
         self.cmb_panes.currentTextChanged.connect(self._on_panes_changed)
         self.cmb_active.currentTextChanged.connect(self._on_active_channels_changed)
         self.chk_virtual.toggled.connect(self._on_virtual_toggled)
-        self.btn_left.clicked.connect(self.scroll_left)
-        self.btn_right.clicked.connect(self.scroll_right)
+        self.btn_left.clicked.connect(lambda: self.scroll_cols(-1))
+        self.btn_right.clicked.connect(lambda: self.scroll_cols(+1))
 
         self.btn_apply_view.clicked.connect(self.apply_selected_view)
         self.btn_save_view.clicked.connect(self.save_view_dialog)
         self.btn_delete_view.clicked.connect(self.delete_selected_view)
         self.btn_clear_pane.clicked.connect(self.clear_active_pane)
 
+        # apply initial ui state
         self.cmb_panes.setCurrentText(str(self.visible_panes))
         self.cmb_active.setCurrentText(str(self.active_channels))
         self.chk_virtual.setChecked(self.virtual_mode)
 
-        self._rebuild_panes_grid(self.visible_panes)
+        # build layout and start visible streams
+        self._rebuild_layout(self.visible_panes)
         self._clamp_active_list_to_count()
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
-
+        self._clamp_viewport_col()
+        self._apply_virtual_visible_streams(full_reload=True)  # first start
         self._update_focus()
         self._update_scroll_buttons()
 
@@ -625,7 +647,7 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(self.show_about)
         help_menu.addAction(act_about)
 
-    # ---------- grid/layout ----------
+    # ---------- layout/scaling ----------
 
     def _clear_layout(self, layout: QGridLayout):
         while layout.count():
@@ -633,14 +655,6 @@ class MainWindow(QMainWindow):
             w = item.widget()
             if w is not None:
                 w.setParent(None)
-
-    def _grid_dims(self, n: int):
-        n = clamp_int(n, 1, 16, 4)
-        if n in (4, 6, 8, 10, 12, 14) and (n % 2 == 0):
-            return 2, n // 2
-        cols = int(math.ceil(math.sqrt(n)))
-        rows = int(math.ceil(n / cols))
-        return rows, cols
 
     def _reset_grid_stretch(self):
         for i in range(0, 16):
@@ -654,27 +668,38 @@ class MainWindow(QMainWindow):
         for c in range(cols):
             self.panes_grid.setColumnStretch(c, 1)
 
-    def _rebuild_panes_grid(self, n: int):
+    def _grid_dims(self, n: int):
+        n = clamp_int(n, 1, 16, 4)
+        # prefer 2 rows for fast column scrolling experience
+        if n in (4, 6, 8, 10, 12, 14) and (n % 2 == 0):
+            return 2, n // 2
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        return rows, cols
+
+    def _rebuild_layout(self, n: int):
         n = clamp_int(n, 1, 16, 4)
         self.visible_panes = n
         self.grid_rows, self.grid_cols = self._grid_dims(n)
 
         self._clear_layout(self.panes_grid)
 
-        for i in range(16):
-            p = self.panes[i]
-            if i < n:
-                p.setVisible(True)
-                r = i // self.grid_cols
-                c = i % self.grid_cols
-                self.panes_grid.addWidget(p, r, c)
-            else:
-                p.setVisible(False)
+        if self.virtual_mode:
+            self._init_virtual_columns()
+            self._layout_virtual_columns()
+        else:
+            # direct mode: place first N panes row-major
+            for i in range(16):
+                p = self.panes[i]
+                if i < n:
+                    p.setVisible(True)
+                    r = i // self.grid_cols
+                    c = i % self.grid_cols
+                    self.panes_grid.addWidget(p, r, c)
+                else:
+                    p.setVisible(False)
 
         self._apply_grid_stretch(self.grid_rows, self.grid_cols)
-
-        if self.active_pane > n:
-            self.active_pane = 1
 
         cw = self.centralWidget()
         if cw is not None:
@@ -684,64 +709,16 @@ class MainWindow(QMainWindow):
             cw.updateGeometry()
             cw.repaint()
 
-    def _on_panes_changed(self, txt: str):
-        n = clamp_int(txt, 1, 16, self.visible_panes)
-        self._rebuild_panes_grid(n)
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
-        self._update_focus()
-        self._update_scroll_buttons()
+        if self.active_pane_widget is None or not self.active_pane_widget.isVisible():
+            self.active_pane_widget = self._first_visible_pane()
 
-    # ---------- pane focus / fullscreen ----------
+    def _first_visible_pane(self):
+        for p in self.panes:
+            if p.isVisible():
+                return p
+        return None
 
-    def on_pane_clicked(self, pane_id: int, is_double: bool):
-        pane_id = clamp_int(pane_id, 1, 16, 1)
-        if pane_id > self.visible_panes:
-            pane_id = 1
-
-        self.active_pane = pane_id
-        self._update_focus()
-
-        if is_double:
-            self.open_fullscreen_for_active()
-
-    def open_fullscreen_for_active(self):
-        if self.fullscreen is not None:
-            return
-
-        pane = self.panes[self.active_pane - 1]
-        ch = pane.assigned_channel
-        if not isinstance(ch, int) or not (1 <= ch <= 16):
-            return
-
-        pane.pause_for_fullscreen()
-
-        self.fullscreen_ctx = {
-            "pane_id": self.active_pane,
-            "channel": ch,
-            "virtual": self.virtual_mode,
-            "viewport_start": self.viewport_start
-        }
-
-        self.fullscreen = FullScreenWindow(self.vlc, self.cfg, ch, f"{APP_NAME} - CH{ch}")
-        self.fullscreen.closed.connect(self._on_fullscreen_closed)
-        self.fullscreen.showFullScreen()
-
-    def _on_fullscreen_closed(self):
-        ctx = self.fullscreen_ctx or {}
-        self.fullscreen = None
-        self.fullscreen_ctx = None
-
-        if ctx.get("virtual"):
-            self._apply_mapping(play=True)
-        else:
-            pid = clamp_int(ctx.get("pane_id", 1), 1, self.visible_panes, 1)
-            ch = clamp_int(ctx.get("channel", 1), 1, 16, 1)
-            self.panes[pid - 1].play_channel(ch)
-
-        self._update_focus()
-
-    # ---------- virtual list model ----------
+    # ---------- virtual persistent scrolling ----------
 
     def _normalize_assign_list(self, assign):
         if not isinstance(assign, list):
@@ -789,99 +766,313 @@ class MainWindow(QMainWindow):
             need = self.active_channels - len(self.active_list)
             self.active_list.extend(missing[:need])
 
-    def _max_viewport_start(self):
-        return max(0, len(self.active_list) - self.visible_panes)
+    def _total_virtual_cols(self):
+        rows = max(1, self.grid_rows)
+        return int(math.ceil(max(1, len(self.active_list)) / rows))
 
-    def _clamp_viewport(self):
-        self.viewport_start = clamp_int(self.viewport_start, 0, self._max_viewport_start(), 0)
+    def _max_viewport_col(self):
+        return max(0, self._total_virtual_cols() - self.grid_cols)
 
-    def _apply_mapping(self, play: bool):
+    def _clamp_viewport_col(self):
+        self.viewport_col = clamp_int(self.viewport_col, 0, self._max_viewport_col(), 0)
+
+    def _init_virtual_columns(self):
+        """
+        Initialize columns of panes for the visible grid.
+        Column-major assignment: each column has `grid_rows` panes.
+        These panes are rotated during scroll so overlapping columns keep playing.
+        """
+        self.virtual_cols.clear()
+
+        rows = max(1, self.grid_rows)
+        cols = max(1, self.grid_cols)
+        need = rows * cols
+
+        pool = [self.panes[i] for i in range(need)]
+        for i in range(need, 16):
+            self.panes[i].setVisible(False)
+
+        for c in range(cols):
+            col = []
+            for r in range(rows):
+                idx = c * rows + r
+                if idx < len(pool):
+                    p = pool[idx]
+                    p.setVisible(True)
+                    col.append(p)
+            # ensure column length rows (should be)
+            self.virtual_cols.append(col)
+
+    def _layout_virtual_columns(self):
+        """
+        Place current virtual_cols into the grid without restarting streams.
+        """
+        rows = max(1, self.grid_rows)
+        cols = max(1, self.grid_cols)
+
+        for c in range(cols):
+            for r in range(rows):
+                if c >= len(self.virtual_cols):
+                    continue
+                if r >= len(self.virtual_cols[c]):
+                    continue
+                p = self.virtual_cols[c][r]
+                self.panes_grid.removeWidget(p)
+                self.panes_grid.addWidget(p, r, c)
+
+    def _channel_for_cell(self, abs_col: int, row: int):
+        """
+        Map virtual matrix cell (abs_col, row) to channel from active_list.
+        Column-major packing: abs_col*rows + row.
+        """
+        rows = max(1, self.grid_rows)
+        idx = abs_col * rows + row
+        if 0 <= idx < len(self.active_list):
+            return self.active_list[idx]
+        return None
+
+    def _apply_virtual_visible_streams(self, full_reload: bool):
+        """
+        Start streams only for visible panes.
+        full_reload=True means start all visible panes based on viewport_col.
+        full_reload=False means caller already preserved overlapping columns and retuned only new column.
+        """
         if not self.virtual_mode:
-            for i in range(self.visible_panes, 16):
-                self.panes[i].stop_to_idle()
             return
 
+        rows = max(1, self.grid_rows)
+        cols = max(1, self.grid_cols)
+
         self._clamp_active_list_to_count()
-        self._clamp_viewport()
+        self._clamp_viewport_col()
 
-        for i in range(self.visible_panes):
-            pane = self.panes[i]
-            idx = self.viewport_start + i
-            if idx < len(self.active_list):
-                ch = self.active_list[idx]
-                if play:
-                    pane.play_channel(ch)
-                else:
-                    pane.assigned_channel = ch
-                    pane.label.setText(f"Pane {pane.pane_id}: CH{ch} (saved)")
+        if full_reload:
+            # start all visible panes for current viewport
+            for c in range(cols):
+                abs_col = self.viewport_col + c
+                for r in range(rows):
+                    if c >= len(self.virtual_cols) or r >= len(self.virtual_cols[c]):
+                        continue
+                    p = self.virtual_cols[c][r]
+                    ch = self._channel_for_cell(abs_col, r)
+                    if isinstance(ch, int):
+                        p.play_channel(ch)
+                    else:
+                        p.stop_to_idle()
+
+    def scroll_cols(self, delta_cols: int):
+        """
+        Scroll virtual matrix by columns.
+        Persistent behavior:
+        - columns that stay visible keep their PlayerPane instances -> no stream reload
+        - only the newly revealed column is (re)loaded
+        """
+        if not self.virtual_mode:
+            return
+
+        rows = max(1, self.grid_rows)
+        cols = max(1, self.grid_cols)
+
+        if cols <= 0 or rows <= 0:
+            return
+
+        step = 1 if delta_cols > 0 else -1
+        count = abs(int(delta_cols))
+
+        for _ in range(count):
+            if step > 0:
+                if self.viewport_col >= self._max_viewport_col():
+                    break
+                self.viewport_col += 1
+
+                # rotate columns left: [A,B,C] -> [B,C,A]
+                old_left = self.virtual_cols.popleft()
+                self.virtual_cols.append(old_left)
+
+                # new rightmost column is old_left; load channels for abs_col = viewport_col + cols - 1
+                abs_col = self.viewport_col + cols - 1
+                for r in range(rows):
+                    if r >= len(old_left):
+                        continue
+                    ch = self._channel_for_cell(abs_col, r)
+                    if isinstance(ch, int):
+                        old_left[r].play_channel(ch)
+                    else:
+                        old_left[r].stop_to_idle()
+
             else:
-                pane.stop_to_idle()
+                if self.viewport_col <= 0:
+                    break
+                self.viewport_col -= 1
 
-        for i in range(self.visible_panes, 16):
-            self.panes[i].stop_to_idle()
+                # rotate columns right: [A,B,C] -> [C,A,B]
+                old_right = self.virtual_cols.pop()
+                self.virtual_cols.appendleft(old_right)
+
+                # new leftmost column is old_right; load channels for abs_col = viewport_col
+                abs_col = self.viewport_col
+                for r in range(rows):
+                    if r >= len(old_right):
+                        continue
+                    ch = self._channel_for_cell(abs_col, r)
+                    if isinstance(ch, int):
+                        old_right[r].play_channel(ch)
+                    else:
+                        old_right[r].stop_to_idle()
+
+            self._layout_virtual_columns()
+
+        self._update_focus()
+        self._update_scroll_buttons()
+
+    def _virtual_jump_to_channel(self, ch: int):
+        """
+        Jump by scrolling columns (persistent) so that channel becomes visible.
+        Finds its absolute column in active_list and scrolls minimal number of columns.
+        """
+        rows = max(1, self.grid_rows)
+        if rows <= 0:
+            return
+
+        try:
+            idx = self.active_list.index(ch)
+        except ValueError:
+            return
+
+        target_abs_col = idx // rows
+
+        # current focused pane position (col in visible grid) affects desired viewport_col
+        focus_col = 0
+        if self.active_pane_widget is not None:
+            pos = self._find_widget_pos_in_virtual(self.active_pane_widget)
+            if pos is not None:
+                _, focus_col = pos
+
+        desired_viewport = target_abs_col - focus_col
+        desired_viewport = max(0, min(desired_viewport, self._max_viewport_col()))
+        delta = desired_viewport - self.viewport_col
+        if delta != 0:
+            self.scroll_cols(delta)
+
+    def _find_widget_pos_in_virtual(self, pane_widget: PlayerPane):
+        rows = max(1, self.grid_rows)
+        cols = max(1, self.grid_cols)
+        for c in range(cols):
+            if c >= len(self.virtual_cols):
+                continue
+            for r in range(rows):
+                if r >= len(self.virtual_cols[c]):
+                    continue
+                if self.virtual_cols[c][r] is pane_widget:
+                    return (r, c)
+        return None
+
+    # ---------- focus / fullscreen ----------
+
+    def on_pane_clicked(self, pane_widget: PlayerPane, is_double: bool):
+        if pane_widget is None or not pane_widget.isVisible():
+            return
+
+        self.active_pane_widget = pane_widget
+        self._update_focus()
+
+        if is_double:
+            self.open_fullscreen_for_pane(pane_widget)
+
+    def open_fullscreen_for_pane(self, pane_widget: PlayerPane):
+        if self.fullscreen is not None:
+            return
+
+        ch = pane_widget.assigned_channel
+        if not isinstance(ch, int) or not (1 <= ch <= 16):
+            return
+
+        self.fullscreen_pane = pane_widget
+        pane_widget.pause_for_fullscreen()
+
+        self.fullscreen = FullScreenWindow(self.vlc, self.cfg, ch, f"{APP_NAME} - CH{ch}")
+        self.fullscreen.closed.connect(self._on_fullscreen_closed)
+        self.fullscreen.showFullScreen()
+
+    def _on_fullscreen_closed(self):
+        if self.fullscreen is None:
+            return
+        self.fullscreen = None
+
+        # restore pane stream (same channel) without touching others
+        p = self.fullscreen_pane
+        self.fullscreen_pane = None
+        if p is not None and p.isVisible() and isinstance(p.assigned_channel, int):
+            p.play_channel(p.assigned_channel)
+
+        self._update_focus()
 
     # ---------- controls ----------
 
     def _update_focus(self):
         for p in self.panes:
-            p.set_focused(p.pane_id == self.active_pane and p.isVisible())
+            if not p.isVisible():
+                p.set_focused(False)
+            else:
+                p.set_focused(p is self.active_pane_widget)
 
         if self.virtual_mode:
-            start = self.viewport_start + 1
-            end = min(self.viewport_start + self.visible_panes, len(self.active_list))
+            rows = max(1, self.grid_rows)
+            total_cols = self._total_virtual_cols()
+            start_col = self.viewport_col
+            end_col = min(self.viewport_col + self.grid_cols - 1, max(0, total_cols - 1))
             self.info.setText(
-                f"Active pane: {self.active_pane} | Virtual window: {start}-{end} / {len(self.active_list)} | Grid: {self.grid_rows}x{self.grid_cols}"
+                f"Focus: {getattr(self.active_pane_widget,'pane_id', '-')}"
+                f" | Virtual matrix: {total_cols}x{rows} (cols x rows)"
+                f" | View cols: {start_col}-{end_col}"
+                f" | Display: {self.grid_rows}x{self.grid_cols}"
             )
         else:
             self.info.setText(
-                f"Active pane: {self.active_pane} | Direct mode | Grid: {self.grid_rows}x{self.grid_cols}"
+                f"Focus: {getattr(self.active_pane_widget,'pane_id', '-')}"
+                f" | Direct mode | Display: {self.grid_rows}x{self.grid_cols}"
             )
 
     def _update_scroll_buttons(self):
-        enable = self.virtual_mode and len(self.active_list) > self.visible_panes
+        enable = self.virtual_mode and self._total_virtual_cols() > self.grid_cols
         self.btn_left.setEnabled(enable)
         self.btn_right.setEnabled(enable)
+
+    def _on_panes_changed(self, txt: str):
+        n = clamp_int(txt, 1, 16, self.visible_panes)
+        self._rebuild_layout(n)
+        self._clamp_viewport_col()
+        if self.virtual_mode:
+            self._apply_virtual_visible_streams(full_reload=True)
+        self._update_focus()
+        self._update_scroll_buttons()
 
     def _on_active_channels_changed(self, txt: str):
         self.active_channels = clamp_int(txt, 1, 16, self.active_channels)
         self._clamp_active_list_to_count()
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
+        self._clamp_viewport_col()
+        if self.virtual_mode:
+            self._apply_virtual_visible_streams(full_reload=True)
         self._update_focus()
         self._update_scroll_buttons()
 
     def _on_virtual_toggled(self, on: bool):
         self.virtual_mode = bool(on)
+        self.viewport_col = 0
+        self._rebuild_layout(self.visible_panes)
         self._clamp_active_list_to_count()
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
+        self._clamp_viewport_col()
+        if self.virtual_mode:
+            self._apply_virtual_visible_streams(full_reload=True)
         self._update_focus()
         self._update_scroll_buttons()
 
-    def scroll_left(self):
-        if not self.virtual_mode:
-            return
-        step = max(1, self.grid_rows)
-        self.viewport_start -= step
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
-        self._update_focus()
-
-    def scroll_right(self):
-        if not self.virtual_mode:
-            return
-        step = max(1, self.grid_rows)
-        self.viewport_start += step
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
-        self._update_focus()
-
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Left:
-            self.scroll_left()
+            self.scroll_cols(-1)
             return
         if event.key() == Qt.Key_Right:
-            self.scroll_right()
+            self.scroll_cols(+1)
             return
         super().keyPressEvent(event)
 
@@ -889,32 +1080,18 @@ class MainWindow(QMainWindow):
         ch = clamp_int(ch, 1, 16, 1)
 
         if not self.virtual_mode:
-            self.panes[self.active_pane - 1].play_channel(ch)
+            if self.active_pane_widget is not None:
+                self.active_pane_widget.play_channel(ch)
             return
 
-        tile_index = self.active_pane - 1
-        try:
-            idx = self.active_list.index(ch)
-            self.viewport_start = idx - tile_index
-        except ValueError:
-            pos = self.viewport_start + tile_index
-            if 0 <= pos < len(self.active_list):
-                self.active_list[pos] = ch
-            else:
-                self.active_list.append(ch)
-                self.active_channels = min(16, len(self.active_list))
-                self.cmb_active.setCurrentText(str(self.active_channels))
-            self._clamp_active_list_to_count()
-
-        self._clamp_viewport()
-        self._apply_mapping(play=True)
-        self._update_focus()
-        self._update_scroll_buttons()
+        # virtual: prefer "jump" by scrolling columns persistently
+        self._virtual_jump_to_channel(ch)
 
     def clear_active_pane(self):
         if self.virtual_mode:
             return
-        self.panes[self.active_pane - 1].stop_to_idle()
+        if self.active_pane_widget is not None:
+            self.active_pane_widget.stop_to_idle()
 
     # ---------- views ----------
 
@@ -934,30 +1111,33 @@ class MainWindow(QMainWindow):
             return
 
         panes = clamp_int(v.get("panes", 4), 1, 16, 4)
+        self.visible_panes = panes
         self.cmb_panes.setCurrentText(str(panes))
-        self._rebuild_panes_grid(panes)
 
-        is_virtual = bool(v.get("virtual", False))
-        self.virtual_mode = is_virtual
-        self.chk_virtual.setChecked(is_virtual)
+        self.virtual_mode = bool(v.get("virtual", False))
+        self.chk_virtual.setChecked(self.virtual_mode)
 
         assign = self._normalize_assign_list(v.get("assign", []))
+        self.active_list = self._active_list_from_assign(assign) or list(range(1, 17))
 
-        if is_virtual:
-            al = self._active_list_from_assign(assign)
-            self.active_list = al if al else list(range(1, 17))
+        self.active_channels = clamp_int(v.get("active_channels", len(self.active_list)), 1, 16, min(16, len(self.active_list)))
+        self.cmb_active.setCurrentText(str(self.active_channels))
 
-            ac = v.get("active_channels", len(self.active_list))
-            self.active_channels = clamp_int(ac, 1, 16, min(16, len(self.active_list)))
-            self.cmb_active.setCurrentText(str(self.active_channels))
-            self._clamp_active_list_to_count()
+        # 'start' is viewport column in this implementation
+        self.viewport_col = clamp_int(v.get("start", 0), 0, 1000, 0)
 
-            self.viewport_start = clamp_int(v.get("start", 0), 0, self._max_viewport_start(), 0)
-            self._apply_mapping(play=True)
+        self._rebuild_layout(self.visible_panes)
+        self._clamp_active_list_to_count()
+        self._clamp_viewport_col()
+
+        if self.virtual_mode:
+            self._apply_virtual_visible_streams(full_reload=True)
         else:
+            # direct: assign per visible pane row-major placement
+            # (uses first N panes); start streams
             for i in range(self.visible_panes):
                 ch = assign[i]
-                if isinstance(ch, int) and 1 <= ch <= 16:
+                if isinstance(ch, int):
                     self.panes[i].play_channel(ch)
                 else:
                     self.panes[i].stop_to_idle()
@@ -974,6 +1154,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.virtual_mode:
+            # store active_list (padded to 16 with nulls)
             assign = []
             for x in self.active_list[:16]:
                 assign.append(x if isinstance(x, int) else None)
@@ -984,7 +1165,7 @@ class MainWindow(QMainWindow):
                 "panes": self.visible_panes,
                 "virtual": True,
                 "active_channels": self.active_channels,
-                "start": self.viewport_start,
+                "start": self.viewport_col,
                 "assign": assign
             }
         else:
@@ -1027,7 +1208,7 @@ class MainWindow(QMainWindow):
             self.visible_panes,
             self.virtual_mode,
             self.active_channels,
-            self.viewport_start,
+            self.viewport_col,
             self.grid_rows,
             self.grid_cols,
             self.active_list
@@ -1050,10 +1231,9 @@ class MainWindow(QMainWindow):
 
         return {
             "panes": self.visible_panes,
-            "active_pane": self.active_pane,
             "virtual": self.virtual_mode,
             "active_channels": self.active_channels,
-            "viewport_start": self.viewport_start,
+            "viewport_col": self.viewport_col,
             "direct_assign": direct_assign,
             "virtual_assign": virt_assign
         }
@@ -1063,33 +1243,30 @@ class MainWindow(QMainWindow):
         if not isinstance(st, dict):
             self.virtual_mode = False
             self.active_channels = 16
-            self.viewport_start = 0
             self.active_list = list(range(1, 17))
+            self.viewport_col = 0
             return
 
         self.visible_panes = clamp_int(st.get("panes", self.visible_panes), 1, 16, self.visible_panes)
-        self.active_pane = clamp_int(st.get("active_pane", 1), 1, 16, 1)
-
         self.virtual_mode = bool(st.get("virtual", False))
         self.active_channels = clamp_int(st.get("active_channels", 16), 1, 16, 16)
-        self.viewport_start = clamp_int(st.get("viewport_start", 0), 0, 15, 0)
+        self.viewport_col = clamp_int(st.get("viewport_col", 0), 0, 1000, 0)
 
         va = self._normalize_assign_list(st.get("virtual_assign", []))
-        al = self._active_list_from_assign(va)
-        self.active_list = al if al else list(range(1, 17))
+        self.active_list = self._active_list_from_assign(va) or list(range(1, 17))
         self._clamp_active_list_to_count()
+        self._clamp_viewport_col()
 
+        # restore direct assignments labels (no autoplay here; started after show)
         da = self._normalize_assign_list(st.get("direct_assign", []))
         for i in range(min(self.visible_panes, 16)):
             ch = da[i]
-            if isinstance(ch, int) and 1 <= ch <= 16:
+            if isinstance(ch, int):
                 self.panes[i].assigned_channel = ch
                 self.panes[i].label.setText(f"Pane {i+1}: CH{ch} (saved)")
             else:
                 self.panes[i].assigned_channel = None
                 self.panes[i].label.setText(f"Pane {i+1}: Idle")
-
-        self._clamp_viewport()
 
     def _save_state(self):
         safe_write_json(self.cfg.state_file, self._state_snapshot())
@@ -1107,7 +1284,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.fullscreen = None
-            self.fullscreen_ctx = None
+            self.fullscreen_pane = None
 
         self._save_state()
 
@@ -1145,12 +1322,12 @@ if __name__ == "__main__":
         pass
 
     w = MainWindow()
-
     app.aboutToQuit.connect(w.cleanup)
     _tick = install_sigint_handler(w)
 
     w.show()
 
+    # start direct-mode saved streams on startup (virtual already starts its visible streams)
     if not w.virtual_mode:
         for i in range(w.visible_panes):
             ch = w.panes[i].assigned_channel
