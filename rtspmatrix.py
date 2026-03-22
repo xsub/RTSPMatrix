@@ -1,14 +1,23 @@
+# rtspmatrix.py
+# Changes vs your current:
+# - VLC quieter: --quiet / --verbose=0
+# - RTSP hardening: :rtsp-tcp + :rtsp-keepalive + :rtsp-timeout
+# - macOS deadlock mitigation: disable HW decode (VideoToolbox) via --avcodec-hw=none and :avcodec-hw=none
+# - Auto-resume: when stream drops or stalls -> exponential backoff retry, using NEW MediaPlayer on each retry
+# - AboutDialog fixed (QT_VERSION_STR / PYQT_VERSION_STR)
+
 import sys
 import os
 import json
 import signal
 import platform
 import threading
+import time
 import configparser
 import importlib.metadata
 
 import vlc
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -52,7 +61,6 @@ def safe_write_json(path: str, obj):
 
 class RtspConfig:
     def __init__(self, ini_path: str = "rtsp.ini"):
-        # allow ';' inside values (password) without treating it as comment
         cp = configparser.RawConfigParser(inline_comment_prefixes=())
         ok = cp.read(ini_path, encoding="utf-8")
         if not ok:
@@ -69,6 +77,18 @@ class RtspConfig:
         self.network_caching_ms = s.getint("network_caching_ms", 250)
         self.open_timeout_ms = s.getint("open_timeout_ms", 2500)
 
+        # resiliency / retry tuning
+        self.poll_interval_ms = s.getint("poll_interval_ms", 500)
+        self.stall_timeout_ms = s.getint("stall_timeout_ms", 6000)
+        self.retry_base_ms = s.getint("retry_base_ms", 1000)
+        self.retry_max_ms = s.getint("retry_max_ms", 20000)
+
+        # live555 idle timeout (seconds, best-effort)
+        self.rtsp_timeout_s = s.getint("rtsp_timeout_s", 4)
+
+        # macOS HW decode can deadlock on glitchy RTSP
+        self.disable_hw_decode = s.getint("disable_hw_decode", 1) != 0
+
         a = cp["app"] if cp.has_section("app") else {}
         self.title = a.get("title", "RTSPMatrix")
         self.default_panes = int(a.get("default_panes", 4))
@@ -83,15 +103,6 @@ class RtspConfig:
 # ---------- views ----------
 
 class ViewsStore:
-    """
-    views.json:
-    {
-      "views": {
-        "FrontDesk": {"panes":4, "assign":[1,2,3,4]},
-        "Night": {"panes":1, "assign":[5]}
-      }
-    }
-    """
     def __init__(self, path: str):
         self.path = path
         self.data = safe_read_json(self.path, {"views": {}})
@@ -127,6 +138,12 @@ class ClickableFrame(QFrame):
 
 
 class PlayerPane(QWidget):
+    """
+    Auto-resume:
+      - state polling detects drop/stall
+      - schedules exponential retry
+      - retry uses a NEW MediaPlayer (old disposed async) to escape broken live555 state
+    """
     def __init__(self, pane_id: int, vlc_instance: vlc.Instance, cfg: RtspConfig, on_focus):
         super().__init__()
         self.pane_id = pane_id
@@ -152,16 +169,24 @@ class PlayerPane(QWidget):
 
         self.player = None
         self.assigned_channel = None
-        self._attempt_token = 0
-        self._attempt_channel = None
+
+        # retry/stall tracking
+        self._retry_attempt = 0
+        self._retry_pending = False
+        self._opening_since_ts = 0.0
+        self._last_playing_ts = 0.0
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(self.cfg.poll_interval_ms)
+        self.poll_timer.timeout.connect(self._poll_state)
 
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
         self.open_timer.timeout.connect(self._open_timeout)
 
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(120)
-        self.poll_timer.timeout.connect(self._poll_state)
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self._retry_now)
 
         QTimer.singleShot(0, self._ensure_player)
 
@@ -201,7 +226,13 @@ class PlayerPane(QWidget):
             dispose_player_async(old)
         return self.player
 
+    def _cancel_retry(self):
+        self._retry_pending = False
+        if self.retry_timer.isActive():
+            self.retry_timer.stop()
+
     def stop_to_idle(self):
+        self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
         if self.poll_timer.isActive():
@@ -210,92 +241,126 @@ class PlayerPane(QWidget):
             dispose_player_async(self.player)
         self.player = self._new_player()
         self.assigned_channel = None
-        self._attempt_channel = None
+        self._retry_attempt = 0
+        self._opening_since_ts = 0.0
+        self._last_playing_ts = 0.0
         self.label.setText(f"Pane {self.pane_id}: Idle")
 
     def play_channel(self, ch: int):
         self._ensure_player()
         ch = int(max(1, min(16, ch)))
 
-        self._attempt_token += 1
-        token = self._attempt_token
-        self._attempt_channel = ch
+        self._cancel_retry()
+        self._retry_attempt = 0
 
-        self.label.setText(f"Pane {self.pane_id}: Opening CH{ch}...")
+        self.assigned_channel = ch
+        now = time.monotonic()
+        self._opening_since_ts = now
+        self._last_playing_ts = 0.0
+
+        self._start_play(ch, reason="play")
+        if not self.poll_timer.isActive():
+            self.poll_timer.start()
+
+    def _start_play(self, ch: int, reason: str):
         p = self._swap_player()
 
         url = self.cfg.url(ch)
         media = self.vlc.media_new(url)
 
-        # creds passed as VLC options (no URL encoding pitfalls)
         if self.cfg.user:
             media.add_option(f":rtsp-user={self.cfg.user}")
         if self.cfg.password:
             media.add_option(f":rtsp-pwd={self.cfg.password}")
+
+        # harden RTSP
         if self.cfg.tcp:
             media.add_option(":rtsp-tcp")
+        media.add_option(":rtsp-keepalive")
+        media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
+
+        # jitter buffer
         media.add_option(f":network-caching={self.cfg.network_caching_ms}")
 
-        p.set_media(media)
+        # macOS HW decode deadlock mitigation
+        if self.cfg.disable_hw_decode:
+            media.add_option(":avcodec-hw=none")
 
+        p.set_media(media)
         try:
             p.play()
         except Exception:
-            self._fail(token, ch, f"Pane {self.pane_id}: No stream on CH{ch}")
-            return
+            pass
 
+        self.label.setText(f"Pane {self.pane_id}: Opening CH{ch} ({reason})")
         self.open_timer.start(self.cfg.open_timeout_ms)
-        if not self.poll_timer.isActive():
-            self.poll_timer.start()
+
+    def _schedule_retry(self, why: str):
+        if self._retry_pending or self.assigned_channel is None:
+            return
+        self._retry_pending = True
+        self._retry_attempt += 1
+
+        delay = min(self.cfg.retry_max_ms, self.cfg.retry_base_ms * (2 ** max(0, self._retry_attempt - 1)))
+        ch = self.assigned_channel
+        self.label.setText(f"Pane {self.pane_id}: CH{ch} lost ({why}), retry in {delay}ms")
+        self.retry_timer.start(delay)
+
+    def _retry_now(self):
+        self._retry_pending = False
+        if self.assigned_channel is None:
+            return
+        ch = self.assigned_channel
+        self._opening_since_ts = time.monotonic()
+        self._start_play(ch, reason=f"retry#{self._retry_attempt}")
 
     def _poll_state(self):
-        if self.player is None:
+        if self.player is None or self.assigned_channel is None:
             return
+        ch = self.assigned_channel
+        now = time.monotonic()
 
-        state = self.player.get_state()
-        token = self._attempt_token
-        ch = self._attempt_channel
-        if ch is None:
-            return
+        try:
+            st = self.player.get_state()
+        except Exception:
+            st = vlc.State.Error
 
-        if state == vlc.State.Playing:
+        if st == vlc.State.Playing:
+            self._last_playing_ts = now
+            self._opening_since_ts = 0.0
+            self._retry_attempt = 0
             if self.open_timer.isActive():
                 self.open_timer.stop()
-            self.poll_timer.stop()
-            self.assigned_channel = ch
             self.label.setText(f"Pane {self.pane_id}: CH{ch} playing")
             return
 
-        if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
-            self._fail(token, ch, f"Pane {self.pane_id}: No stream on CH{ch}")
+        if st in (vlc.State.Opening, vlc.State.Buffering):
+            if self._opening_since_ts > 0.0:
+                if (now - self._opening_since_ts) * 1000.0 > self.cfg.stall_timeout_ms:
+                    self._schedule_retry("stall(opening/buffering)")
+            return
+
+        if st in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
+            self._schedule_retry(f"state={st}")
+            return
+
+        # other non-playing; if we were playing before and now stalled too long
+        if self._last_playing_ts > 0.0:
+            if (now - self._last_playing_ts) * 1000.0 > self.cfg.stall_timeout_ms:
+                self._schedule_retry(f"stall(state={st})")
 
     def _open_timeout(self):
-        if self.player is None:
+        if self.player is None or self.assigned_channel is None:
             return
-        ch = self._attempt_channel
-        token = self._attempt_token
-        if ch is None:
-            return
-        if self.player.get_state() != vlc.State.Playing:
-            self._fail(token, ch, f"Pane {self.pane_id}: No stream on CH{ch}")
-
-    def _fail(self, token: int, ch: int, msg: str):
-        if token != self._attempt_token:
-            return
-
-        if self.open_timer.isActive():
-            self.open_timer.stop()
-        if self.poll_timer.isActive():
-            self.poll_timer.stop()
-
-        self.label.setText(msg)
-
-        if self.player is not None:
-            dispose_player_async(self.player)
-        self.player = self._new_player()
-        self.assigned_channel = None
+        try:
+            st = self.player.get_state()
+        except Exception:
+            st = vlc.State.Error
+        if st != vlc.State.Playing:
+            self._schedule_retry("open-timeout")
 
     def shutdown(self):
+        self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
         if self.poll_timer.isActive():
@@ -315,8 +380,8 @@ class AboutDialog(QDialog):
         text.setReadOnly(True)
 
         py_ver = sys.version.replace("\n", " ")
-        qt_ver = QApplication.qtVersion()
-        pyqt_ver = getattr(sys.modules.get("PyQt5"), "__version__", "unknown")
+        qt_ver = QT_VERSION_STR
+        pyqt_ver = PYQT_VERSION_STR
 
         try:
             pv_vlc = importlib.metadata.version("python-vlc")
@@ -324,7 +389,11 @@ class AboutDialog(QDialog):
             pv_vlc = "unknown"
 
         try:
-            libvlc_ver = vlc.libvlc_get_version().decode("utf-8", errors="ignore")
+            libvlc_ver = vlc.libvlc_get_version()
+            if isinstance(libvlc_ver, bytes):
+                libvlc_ver = libvlc_ver.decode("utf-8", errors="ignore")
+            else:
+                libvlc_ver = str(libvlc_ver)
         except Exception:
             libvlc_ver = "unknown"
 
@@ -342,6 +411,12 @@ class AboutDialog(QDialog):
         info.append(f"TCP: {cfg.tcp}")
         info.append(f"network_caching_ms: {cfg.network_caching_ms}")
         info.append(f"open_timeout_ms: {cfg.open_timeout_ms}")
+        info.append(f"poll_interval_ms: {cfg.poll_interval_ms}")
+        info.append(f"stall_timeout_ms: {cfg.stall_timeout_ms}")
+        info.append(f"retry_base_ms: {cfg.retry_base_ms}")
+        info.append(f"retry_max_ms: {cfg.retry_max_ms}")
+        info.append(f"rtsp_timeout_s: {cfg.rtsp_timeout_s}")
+        info.append(f"disable_hw_decode: {cfg.disable_hw_decode}")
         info.append("")
         info.append(f"Active panes: {panes}")
         info.append(f"Config: rtsp.ini")
@@ -374,10 +449,16 @@ class MainWindow(QMainWindow):
         self.cfg = RtspConfig("rtsp.ini")
         self.views = ViewsStore(self.cfg.views_file)
 
-        vlc_args = ["--no-video-title-show"]
+        vlc_args = [
+            "--quiet",
+            "--verbose=0",
+            "--no-video-title-show",
+        ]
         if self.cfg.tcp:
             vlc_args.append("--rtsp-tcp")
         vlc_args.append(f"--network-caching={self.cfg.network_caching_ms}")
+        if self.cfg.disable_hw_decode:
+            vlc_args.append("--avcodec-hw=none")
         self.vlc = vlc.Instance(vlc_args)
 
         self.setWindowTitle(self.cfg.title)
@@ -389,7 +470,6 @@ class MainWindow(QMainWindow):
         main.setContentsMargins(8, 8, 8, 8)
         main.setSpacing(8)
 
-        # ---- top channel buttons 1..16
         self.btn_channels = QButtonGroup(self)
         self.btn_channels.setExclusive(False)
         grid_btn = QGridLayout()
@@ -402,7 +482,6 @@ class MainWindow(QMainWindow):
             grid_btn.addWidget(b, i // 8, i % 8)
         main.addLayout(grid_btn)
 
-        # ---- controls row: panes count, views, save/load/delete, clear, about
         controls = QHBoxLayout()
         controls.setSpacing(10)
 
@@ -430,12 +509,10 @@ class MainWindow(QMainWindow):
 
         main.addLayout(controls)
 
-        # ---- status
         self.info = QLabel("Active pane: 1", self)
         self.info.setStyleSheet("color: #ddd;")
         main.addWidget(self.info)
 
-        # ---- 4x4 panes (hide/show up to N)
         self.panes_grid = QGridLayout()
         self.panes_grid.setSpacing(8)
 
@@ -449,13 +526,11 @@ class MainWindow(QMainWindow):
 
         main.addLayout(self.panes_grid, 1)
 
-        # ---- state
         self.active_pane = 1
         self.visible_panes = max(1, min(16, int(self.cfg.default_panes)))
 
         self._reload_views_combo()
 
-        # ---- wiring
         self.btn_channels.buttonClicked[int].connect(self.on_channel_pressed)
         self.cmb_panes.currentTextChanged.connect(self._on_panes_changed)
         self.btn_apply_view.clicked.connect(self.apply_selected_view)
@@ -464,15 +539,17 @@ class MainWindow(QMainWindow):
         self.btn_clear_pane.clicked.connect(self.clear_active_pane)
         self.btn_about.clicked.connect(self.show_about)
 
-        # ---- restore last state (optional)
         self._restore_state()
 
-        # ---- apply initial UI state
         self.cmb_panes.setCurrentText(str(self.visible_panes))
         self._apply_panes_visibility(self.visible_panes)
         self._update_focus()
 
-    # ----- views/state helpers
+        # start saved channels
+        for i in range(self.visible_panes):
+            ch = self.panes[i].assigned_channel
+            if isinstance(ch, int):
+                self.panes[i].play_channel(ch)
 
     def _reload_views_combo(self):
         names = self.views.list_names()
@@ -482,30 +559,20 @@ class MainWindow(QMainWindow):
             self.cmb_views.addItem(n)
 
     def _state_snapshot(self):
-        assign = []
-        for p in self.panes:
-            assign.append(p.assigned_channel)
-        return {
-            "panes": self.visible_panes,
-            "active_pane": self.active_pane,
-            "assign": assign[:16]
-        }
+        assign = [p.assigned_channel for p in self.panes]
+        return {"panes": self.visible_panes, "active_pane": self.active_pane, "assign": assign[:16]}
 
     def _restore_state(self):
         st = safe_read_json(self.cfg.state_file, None)
         if not isinstance(st, dict):
             return
-
         panes = st.get("panes")
         active = st.get("active_pane")
         assign = st.get("assign")
-
         if isinstance(panes, int):
             self.visible_panes = max(1, min(16, panes))
         if isinstance(active, int):
             self.active_pane = max(1, min(16, active))
-
-        # apply assignments after panes exist; do not auto-play here (keeps startup fast)
         if isinstance(assign, list):
             for i in range(min(16, len(assign))):
                 ch = assign[i]
@@ -518,8 +585,6 @@ class MainWindow(QMainWindow):
 
     def _save_state(self):
         safe_write_json(self.cfg.state_file, self._state_snapshot())
-
-    # ----- pane focus / layout
 
     def _update_focus(self):
         for p in self.panes:
@@ -548,16 +613,11 @@ class MainWindow(QMainWindow):
             return
         self._apply_panes_visibility(n)
 
-    # ----- channel actions
-
     def on_channel_pressed(self, ch: int):
-        pane = self.panes[self.active_pane - 1]
-        pane.play_channel(ch)
+        self.panes[self.active_pane - 1].play_channel(ch)
 
     def clear_active_pane(self):
         self.panes[self.active_pane - 1].stop_to_idle()
-
-    # ----- views actions
 
     def apply_selected_view(self):
         name = self.cmb_views.currentText().strip()
@@ -566,14 +626,10 @@ class MainWindow(QMainWindow):
         v = self.views.get(name)
         if not isinstance(v, dict):
             return
-
-        panes = v.get("panes", 4)
+        panes = int(v.get("panes", 4))
         assign = v.get("assign", [])
-
-        self.cmb_panes.setCurrentText(str(int(panes)))
-        self._apply_panes_visibility(int(panes))
-
-        # apply: start streams for assigned channels; idle for None/missing
+        self.cmb_panes.setCurrentText(str(panes))
+        self._apply_panes_visibility(panes)
         for i in range(1, 17):
             p = self.panes[i - 1]
             if i > self.visible_panes:
@@ -591,7 +647,6 @@ class MainWindow(QMainWindow):
         name = (name or "").strip()
         if not name:
             return
-
         panes = self.visible_panes
         assign = []
         for i in range(1, 17):
@@ -600,7 +655,6 @@ class MainWindow(QMainWindow):
                 assign.append(p.assigned_channel)
             else:
                 assign.append(None)
-
         self.views.save(name, panes, assign)
         self._reload_views_combo()
         self.cmb_views.setCurrentText(name)
@@ -616,21 +670,15 @@ class MainWindow(QMainWindow):
         self.views.delete(name)
         self._reload_views_combo()
 
-    # ----- about
-
     def show_about(self):
         dlg = AboutDialog(self, self.cfg, self.visible_panes)
         dlg.exec_()
-
-    # ----- shutdown
 
     def cleanup(self):
         if self._cleaned:
             return
         self._cleaned = True
-
         self._save_state()
-
         for p in self.panes:
             p.shutdown()
         try:
@@ -646,23 +694,18 @@ class MainWindow(QMainWindow):
 def install_sigint_handler(window: MainWindow):
     def _sigint(_signum, _frame):
         QTimer.singleShot(0, window.close)
-
     signal.signal(signal.SIGINT, _sigint)
-
-    # ensure Python gets chances to process signals while Qt loop runs
     tick = QTimer()
     tick.setInterval(200)
     tick.timeout.connect(lambda: None)
     tick.start()
-    return tick  # keep reference alive
+    return tick
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
-
     app.aboutToQuit.connect(w.cleanup)
     _tick = install_sigint_handler(w)
-
     w.show()
     sys.exit(app.exec_())
