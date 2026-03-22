@@ -1,5 +1,10 @@
 {
   "views": {
+    "EXT": {
+      "panes": 2,
+      "virtual": false,
+      "assign": [8, 9]
+    },
     "ALL": {
       "panes": 14,
       "virtual": false,
