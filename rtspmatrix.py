@@ -9,6 +9,7 @@
 import sys
 import os
 import json
+import math
 import signal
 import platform
 import threading
@@ -21,7 +22,7 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_ST
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
-    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QSizePolicy,
     QPushButton, QButtonGroup, QLabel, QComboBox,
     QDialog, QTextEdit, QInputDialog, QMessageBox
 )
@@ -29,7 +30,34 @@ from PyQt5.QtWidgets import (
 
 # ---------- utils ----------
 
+# All in-flight disposal threads, so MainWindow.cleanup() can join them
+# before releasing the libVLC instance.  Without this the daemon threads
+# may still be running stop()/release() on a MediaPlayer when the parent
+# vlc.Instance is freed -> use-after-free crash on exit.
+_disposal_threads = []
+_disposal_lock = threading.Lock()
+
+
 def dispose_player_async(p: vlc.MediaPlayer):
+    """Stop+release a MediaPlayer on a background thread.
+
+    Detach the OS window handle SYNCHRONOUSLY on the GUI thread first:
+    libVLC's render thread may otherwise still try to draw into a freed
+    HWND/XWindow/NSView, which is a use-after-free crash on macOS in
+    particular.  Same fix lives in the virtual variant.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            p.set_xwindow(0)
+        elif sys.platform.startswith("win"):
+            p.set_hwnd(0)
+        elif sys.platform.startswith("darwin"):
+            p.set_nsobject(0)
+        else:
+            p.set_xwindow(0)
+    except Exception:
+        pass
+
     def _w():
         try:
             p.stop()
@@ -39,7 +67,27 @@ def dispose_player_async(p: vlc.MediaPlayer):
             p.release()
         except Exception:
             pass
-    threading.Thread(target=_w, daemon=True).start()
+
+    t = threading.Thread(target=_w, daemon=True)
+    with _disposal_lock:
+        _disposal_threads.append(t)
+    t.start()
+
+
+def join_disposal_threads(timeout_total: float = 3.0):
+    """Wait (with a global timeout) for all in-flight disposal threads."""
+    deadline = time.monotonic() + timeout_total
+    with _disposal_lock:
+        threads = list(_disposal_threads)
+        _disposal_threads.clear()
+    for t in threads:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        try:
+            t.join(timeout=remaining)
+        except Exception:
+            pass
 
 
 def safe_read_json(path: str, default):
@@ -187,10 +235,17 @@ class PlayerPane(QWidget):
         self.cfg = cfg
         self.on_focus = on_focus
 
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self.frame = ClickableFrame(self)
         self.frame.setFrameShape(QFrame.Box)
         self.frame.setStyleSheet("background: black; border: 3px solid #333;")
         self.frame.setMinimumSize(240, 160)
+        self.frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Force a real OS-level window handle independent of the parent
+        # widget, so VLC binds to the video frame, not the toplevel.  Without
+        # this, every player can end up rendering on top of every other.
+        self.frame.setAttribute(Qt.WA_NativeWindow, True)
         self.frame.clicked.connect(self._clicked)
 
         self.label = QLabel(f"Pane {pane_id}: Idle", self)
@@ -246,6 +301,32 @@ class PlayerPane(QWidget):
         else:
             player.set_xwindow(wid)
 
+    def _detach_player_window(self):
+        """Tell libVLC to stop drawing into our QFrame, but keep the player
+        alive.  Used during grid rebuilds, where the QFrame's native window
+        handle is about to be invalidated by reparenting."""
+        if self.player is None:
+            return
+        try:
+            if sys.platform.startswith("linux"):
+                self.player.set_xwindow(0)
+            elif sys.platform.startswith("win"):
+                self.player.set_hwnd(0)
+            elif sys.platform.startswith("darwin"):
+                self.player.set_nsobject(0)
+        except Exception:
+            pass
+
+    def rebind_to_current_frame(self):
+        """Re-attach the live player to the (possibly fresh) QFrame winId
+        after a grid rebuild.  Cheap: no reconnect, no media reload."""
+        if self.player is None:
+            return
+        try:
+            self._bind_player_window(self.player)
+        except Exception:
+            pass
+
     def _new_player(self) -> vlc.MediaPlayer:
         p = self.vlc.media_player_new()
         self._bind_player_window(p)
@@ -283,13 +364,24 @@ class PlayerPane(QWidget):
         self.label.setText(f"Pane {self.pane_id}: Idle")
 
     def play_channel(self, ch: int):
-        self._ensure_player()
         ch = int(max(1, min(16, ch)))
 
         if not self.cfg.is_channel_active(ch):
             self.stop_to_idle()
             return
 
+        # Idempotent: already playing this exact channel and the player is in
+        # a healthy state -> no-op.  Avoids the wasteful "kill the player and
+        # start over" cycle on every double-press of a channel button.
+        if self.assigned_channel == ch and self.player is not None:
+            try:
+                st = self.player.get_state()
+            except Exception:
+                st = vlc.State.Error
+            if st in (vlc.State.Playing, vlc.State.Opening, vlc.State.Buffering):
+                return
+
+        self._ensure_player()
         self._cancel_retry()
         self._retry_attempt = 0
 
@@ -562,19 +654,17 @@ class MainWindow(QMainWindow):
 
         self.panes_grid = QGridLayout()
         self.panes_grid.setSpacing(8)
-
-        self.panes = []
-        for pid in range(1, 17):
-            pane = PlayerPane(pid, self.vlc, self.cfg, self.set_active_pane)
-            self.panes.append(pane)
-            r = (pid - 1) // 4
-            c = (pid - 1) % 4
-            self.panes_grid.addWidget(pane, r, c)
-
         main.addLayout(self.panes_grid, 1)
 
+        self.panes = [PlayerPane(pid, self.vlc, self.cfg, self.set_active_pane)
+                      for pid in range(1, 17)]
+        self.grid_rows = 0
+        self.grid_cols = 0
+
         self.active_pane = 1
-        self.visible_panes = max(1, min(16, int(self.cfg.default_panes)))
+        # Start at 0 so the first _apply_panes_visibility call treats every
+        # visible pane as "newly revealed" and (re)plays its saved channel.
+        self.visible_panes = 0
 
         self._reload_views_combo()
 
@@ -587,16 +677,17 @@ class MainWindow(QMainWindow):
         self.btn_about.clicked.connect(self.show_about)
 
         self._restore_state()
+        # _restore_state may have set self.visible_panes; capture and reset
+        # so the dropdown change below routes everything through one path.
+        target_panes = self.visible_panes if self.visible_panes > 0 \
+            else max(1, min(16, int(self.cfg.default_panes)))
+        self.visible_panes = 0
 
-        self.cmb_panes.setCurrentText(str(self.visible_panes))
-        self._apply_panes_visibility(self.visible_panes)
+        self.cmb_panes.blockSignals(True)
+        self.cmb_panes.setCurrentText(str(target_panes))
+        self.cmb_panes.blockSignals(False)
+        self._apply_panes_visibility(target_panes)
         self._update_focus()
-
-        # start saved channels
-        for i in range(self.visible_panes):
-            ch = self.panes[i].assigned_channel
-            if isinstance(ch, int):
-                self.panes[i].play_channel(ch)
 
     def _reload_views_combo(self):
         names = self.views.list_names()
@@ -644,11 +735,90 @@ class MainWindow(QMainWindow):
         self.active_pane = pane_id
         self._update_focus()
 
+    @staticmethod
+    def _grid_dims(n: int):
+        """Pick reasonable (rows, cols) for n tiles.  Same heuristic as the
+        virtual variant: 2-row layouts for small even counts (wider tiles),
+        sqrt-based for everything else."""
+        n = max(1, min(16, int(n)))
+        if n % 2 == 0 and n <= 8:
+            return 2, n // 2
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        return rows, cols
+
+    def _clear_pane_layout(self):
+        while self.panes_grid.count():
+            item = self.panes_grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+    def _rebuild_grid(self):
+        """Re-populate self.panes_grid for self.visible_panes tiles, computing
+        rows/cols dynamically.  Reparenting a QFrame invalidates its native
+        window handle, so for every pane that *currently* has a player we:
+          1. detach the live player from the (about-to-die) winId,
+          2. re-add the pane at its new (r, c),
+          3. force Qt to allocate a fresh native window handle,
+          4. rebind the player to that handle.
+        Players keep playing throughout — no reconnect, no media reload."""
+        n = self.visible_panes
+
+        # Detach EVERY pane that has a player, not just the soon-to-be-visible
+        # ones: stop_to_idle leaves a fresh idle player behind, and even those
+        # are bound to the about-to-die frame winId.
+        for p in self.panes:
+            p._detach_player_window()
+
+        self._clear_pane_layout()
+
+        rows, cols = self._grid_dims(n) if n > 0 else (0, 0)
+        self.grid_rows, self.grid_cols = rows, cols
+
+        for i in range(16):
+            self.panes[i].setVisible(i < n)
+
+        for i in range(n):
+            r = i // cols
+            c = i % cols
+            self.panes_grid.addWidget(self.panes[i], r, c)
+
+        # Reset stretches and apply only to the active rows/cols.
+        for k in range(16):
+            self.panes_grid.setRowStretch(k, 0)
+            self.panes_grid.setColumnStretch(k, 0)
+        for r in range(rows):
+            self.panes_grid.setRowStretch(r, 1)
+        for c in range(cols):
+            self.panes_grid.setColumnStretch(c, 1)
+
+        # Force Qt to allocate fresh native window handles before we rebind.
+        for i in range(n):
+            _ = int(self.panes[i].frame.winId())
+        QApplication.processEvents()
+
+        for i in range(n):
+            self.panes[i].rebind_to_current_frame()
+
     def _apply_panes_visibility(self, n: int):
         n = max(1, min(16, int(n)))
+        prev = self.visible_panes
         self.visible_panes = n
-        for i, p in enumerate(self.panes, start=1):
-            p.setVisible(i <= n)
+
+        # Stop streams that just disappeared (saves bandwidth + decode CPU).
+        for i in range(n, prev):
+            self.panes[i].stop_to_idle()
+
+        self._rebuild_grid()
+
+        # (Re)start saved channels for panes that just became visible — the
+        # previous behaviour silently left them stuck in "(saved)".
+        for i in range(prev, n):
+            ch = self.panes[i].assigned_channel
+            if isinstance(ch, int) and self.cfg.is_channel_active(ch):
+                self.panes[i].play_channel(ch)
+
         if self.active_pane > n:
             self.active_pane = 1
         self._update_focus()
@@ -728,6 +898,9 @@ class MainWindow(QMainWindow):
         self._save_state()
         for p in self.panes:
             p.shutdown()
+        # Wait for in-flight stop()/release() workers before tearing down the
+        # VLC instance.  Otherwise libVLC frees state out from under them.
+        join_disposal_threads(timeout_total=3.0)
         try:
             self.vlc.release()
         except Exception:
