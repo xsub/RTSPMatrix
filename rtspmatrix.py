@@ -679,6 +679,13 @@ class MainWindow(QMainWindow):
         self.cmb_panes.addItems([str(i) for i in range(1, 17)])
         controls.addWidget(self.cmb_panes)
 
+        # Layout orientation toggle.  Most useful when n=2 (side-by-side vs
+        # stacked) but applies globally: "horizontal" prefers wide grids,
+        # "vertical" prefers tall ones.  Square layouts are unchanged.
+        self.btn_orient = QPushButton("\u2194", self)
+        self.btn_orient.setFixedWidth(40)
+        controls.addWidget(self.btn_orient)
+
         controls.addWidget(QLabel("View:", self))
         self.cmb_views = QComboBox(self)
         controls.addWidget(self.cmb_views)
@@ -715,11 +722,13 @@ class MainWindow(QMainWindow):
         # Start at 0 so the first _apply_panes_visibility call treats every
         # visible pane as "newly revealed" and (re)plays its saved channel.
         self.visible_panes = 0
+        self.split_orientation = "horizontal"
 
         self._reload_views_combo()
 
         self.btn_channels.buttonClicked[int].connect(self.on_channel_pressed)
         self.cmb_panes.currentTextChanged.connect(self._on_panes_changed)
+        self.btn_orient.clicked.connect(self.toggle_orientation)
         self.btn_apply_view.clicked.connect(self.apply_selected_view)
         self.btn_save_view.clicked.connect(self.save_view_dialog)
         self.btn_delete_view.clicked.connect(self.delete_selected_view)
@@ -736,6 +745,7 @@ class MainWindow(QMainWindow):
         self.cmb_panes.blockSignals(True)
         self.cmb_panes.setCurrentText(str(target_panes))
         self.cmb_panes.blockSignals(False)
+        self._update_orient_button()
         self._apply_panes_visibility(target_panes)
         self._update_focus()
 
@@ -748,7 +758,12 @@ class MainWindow(QMainWindow):
 
     def _state_snapshot(self):
         assign = [p.assigned_channel for p in self.panes]
-        return {"panes": self.visible_panes, "active_pane": self.active_pane, "assign": assign[:16]}
+        return {
+            "panes": self.visible_panes,
+            "active_pane": self.active_pane,
+            "split_orientation": self.split_orientation,
+            "assign": assign[:16],
+        }
 
     def _restore_state(self):
         st = safe_read_json(self.cfg.state_file, None)
@@ -757,10 +772,13 @@ class MainWindow(QMainWindow):
         panes = st.get("panes")
         active = st.get("active_pane")
         assign = st.get("assign")
+        orient = st.get("split_orientation")
         if isinstance(panes, int):
             self.visible_panes = max(1, min(16, panes))
         if isinstance(active, int):
             self.active_pane = max(1, min(16, active))
+        if orient in ("horizontal", "vertical"):
+            self.split_orientation = orient
         if isinstance(assign, list):
             for i in range(min(16, len(assign))):
                 ch = assign[i]
@@ -785,16 +803,22 @@ class MainWindow(QMainWindow):
         self.active_pane = pane_id
         self._update_focus()
 
-    @staticmethod
-    def _grid_dims(n: int):
-        """Pick reasonable (rows, cols) for n tiles.  Same heuristic as the
-        virtual variant: 2-row layouts for small even counts (wider tiles),
-        sqrt-based for everything else."""
+    def _grid_dims(self, n: int):
+        """Pick (rows, cols) for n tiles, honouring self.split_orientation.
+
+        - "horizontal": prefer wide layouts (more cols than rows).
+          n=2 -> (1, 2), n=3 -> (1, 3), n=8 -> (2, 4), n=16 -> (4, 4).
+        - "vertical": prefer tall layouts (more rows than cols).
+          n=2 -> (2, 1), n=3 -> (3, 1), n=8 -> (4, 2), n=16 -> (4, 4).
+        """
         n = max(1, min(16, int(n)))
-        if n % 2 == 0 and n <= 8:
-            return 2, n // 2
-        cols = int(math.ceil(math.sqrt(n)))
-        rows = int(math.ceil(n / cols))
+        orient = getattr(self, "split_orientation", "horizontal")
+        if orient == "vertical":
+            cols = max(1, int(math.floor(math.sqrt(n))))
+            rows = int(math.ceil(n / cols))
+        else:
+            rows = max(1, int(math.floor(math.sqrt(n))))
+            cols = int(math.ceil(n / rows))
         return rows, cols
 
     def _clear_pane_layout(self):
@@ -872,6 +896,23 @@ class MainWindow(QMainWindow):
         if self.active_pane > n:
             self.active_pane = 1
         self._update_focus()
+
+    def _update_orient_button(self):
+        if self.split_orientation == "horizontal":
+            self.btn_orient.setText("\u2194")  # ↔
+            self.btn_orient.setToolTip("Layout: side-by-side  (click to stack)")
+        else:
+            self.btn_orient.setText("\u2195")  # ↕
+            self.btn_orient.setToolTip("Layout: stacked  (click for side-by-side)")
+
+    def toggle_orientation(self):
+        self.split_orientation = (
+            "vertical" if self.split_orientation == "horizontal" else "horizontal"
+        )
+        self._update_orient_button()
+        self._rebuild_grid()
+        self._update_focus()
+        self._save_state()
 
     def _on_panes_changed(self, txt: str):
         try:
