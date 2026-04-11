@@ -8,11 +8,9 @@
 
 import sys
 import os
-import json
 import math
 import signal
 import platform
-import threading
 import time
 import configparser
 import importlib.metadata
@@ -27,82 +25,16 @@ from PyQt5.QtWidgets import (
     QDialog, QTextEdit, QInputDialog, QMessageBox
 )
 
-
-# ---------- utils ----------
-
-# All in-flight disposal threads, so MainWindow.cleanup() can join them
-# before releasing the libVLC instance.  Without this the daemon threads
-# may still be running stop()/release() on a MediaPlayer when the parent
-# vlc.Instance is freed -> use-after-free crash on exit.
-_disposal_threads = []
-_disposal_lock = threading.Lock()
-
-
-def dispose_player_async(p: vlc.MediaPlayer):
-    """Stop+release a MediaPlayer on a background thread.
-
-    Detach the OS window handle SYNCHRONOUSLY on the GUI thread first:
-    libVLC's render thread may otherwise still try to draw into a freed
-    HWND/XWindow/NSView, which is a use-after-free crash on macOS in
-    particular.  Same fix lives in the virtual variant.
-    """
-    try:
-        if sys.platform.startswith("linux"):
-            p.set_xwindow(0)
-        elif sys.platform.startswith("win"):
-            p.set_hwnd(0)
-        elif sys.platform.startswith("darwin"):
-            p.set_nsobject(0)
-        else:
-            p.set_xwindow(0)
-    except Exception:
-        pass
-
-    def _w():
-        try:
-            p.stop()
-        except Exception:
-            pass
-        try:
-            p.release()
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_w, daemon=True)
-    with _disposal_lock:
-        _disposal_threads.append(t)
-    t.start()
-
-
-def join_disposal_threads(timeout_total: float = 3.0):
-    """Wait (with a global timeout) for all in-flight disposal threads."""
-    deadline = time.monotonic() + timeout_total
-    with _disposal_lock:
-        threads = list(_disposal_threads)
-        _disposal_threads.clear()
-    for t in threads:
-        remaining = max(0.0, deadline - time.monotonic())
-        if remaining <= 0:
-            break
-        try:
-            t.join(timeout=remaining)
-        except Exception:
-            pass
-
-
-def safe_read_json(path: str, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def safe_write_json(path: str, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+from rtspmatrix_common import (
+    log,
+    setup_logging,
+    safe_read_json,
+    safe_write_json,
+    parse_labels,
+    dispose_player_async,
+    join_disposal_threads,
+    bind_player_to_window,
+)
 
 
 # ---------- config ----------
@@ -120,7 +52,17 @@ class RtspConfig:
         self.user = s.get("user", "")
         self.password = s.get("password", "")
         self.path = s.get("path", "/cam/realmonitor")
+        # `subtype` is the legacy/global stream selector.  Two new keys override
+        # it per-context for the bandwidth/CPU win:
+        #   subtype_tile = stream used while rendered in a grid tile (default
+        #                  same as `subtype` for backward compat; set to 1 for
+        #                  the substream)
+        #   subtype_full = stream used while in fullscreen / single-pane (the
+        #                  classic variant has no fullscreen yet, so this is
+        #                  reserved for future use)
         self.subtype = s.getint("subtype", 0)
+        self.subtype_tile = s.getint("subtype_tile", self.subtype)
+        self.subtype_full = s.getint("subtype_full", self.subtype)
         self.tcp = s.getint("tcp", 1) != 0
         self.network_caching_ms = s.getint("network_caching_ms", 250)
         self.open_timeout_ms = s.getint("open_timeout_ms", 2500)
@@ -142,27 +84,16 @@ class RtspConfig:
         self.default_panes = int(a.get("default_panes", 4))
         self.views_file = a.get("views_file", "views.json")
         self.state_file = a.get("state_file", "state.json")
+        self.log_level = a.get("log_level", "INFO")
+        self.log_file = a.get("log_file", "")
 
         raw_labels = cp["view"].get("labels", "") if cp.has_section("view") else ""
-        self.labels = self._parse_labels(raw_labels)
+        self.labels = parse_labels(raw_labels)
 
-    def url(self, channel: int) -> str:
+    def url(self, channel: int, hd: bool = False) -> str:
         ch = max(1, min(16, int(channel)))
-        return f"rtsp://{self.host}:{self.port}{self.path}?channel={ch}&subtype={self.subtype}"
-
-    @staticmethod
-    def _parse_labels(raw: str) -> list:
-        """Parse `labels = { A, B, C, ... }` into a 16-entry list (None for missing)."""
-        if not raw:
-            return [None] * 16
-        s = raw.strip()
-        if s.startswith("{"):
-            s = s[1:]
-        if s.endswith("}"):
-            s = s[:-1]
-        parts = [p.strip() for p in s.split(",")]
-        parts = [p for p in parts if p != ""]
-        return [parts[i] if i < len(parts) else None for i in range(16)]
+        sub = self.subtype_full if hd else self.subtype_tile
+        return f"rtsp://{self.host}:{self.port}{self.path}?channel={ch}&subtype={sub}"
 
     def label_for(self, ch):
         try:
@@ -224,10 +155,20 @@ class ClickableFrame(QFrame):
 class PlayerPane(QWidget):
     """
     Auto-resume:
-      - state polling detects drop/stall
-      - schedules exponential retry
-      - retry uses a NEW MediaPlayer (old disposed async) to escape broken live555 state
+      - libVLC state events drive the state machine on the GUI thread
+        (queued via a Qt signal because the events fire on libVLC's threads)
+      - a slow watchdog timer covers the silent-stall case (libVLC keeps
+        reporting Playing but no new frames arrive)
+      - on drop/stall the retry uses a NEW MediaPlayer (old disposed async)
+        to escape broken live555 state
     """
+
+    # libVLC events fire on libVLC's internal threads.  Emitting a Qt signal
+    # marshals the call back to the GUI thread via a queued connection.  The
+    # int is the player generation: events from a swapped-out player carry an
+    # older generation and the slot drops them.
+    state_event = pyqtSignal(str, int)
+
     def __init__(self, pane_id: int, vlc_instance: vlc.Instance, cfg: RtspConfig, on_focus):
         super().__init__()
         self.pane_id = pane_id
@@ -265,11 +206,17 @@ class PlayerPane(QWidget):
         self._retry_attempt = 0
         self._retry_pending = False
         self._opening_since_ts = 0.0
-        self._last_playing_ts = 0.0
+        self._last_progress_ts = 0.0
+        self._is_playing = False
+        self._player_gen = 0
 
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(self.cfg.poll_interval_ms)
-        self.poll_timer.timeout.connect(self._poll_state)
+        # The watchdog only checks "are we still making forward progress" —
+        # it does not poll get_state().  All state transitions come from
+        # libVLC events via state_event.
+        watchdog_ms = max(self.cfg.poll_interval_ms, 1000)
+        self.watchdog_timer = QTimer(self)
+        self.watchdog_timer.setInterval(watchdog_ms)
+        self.watchdog_timer.timeout.connect(self._watchdog_tick)
 
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
@@ -278,6 +225,10 @@ class PlayerPane(QWidget):
         self.retry_timer = QTimer(self)
         self.retry_timer.setSingleShot(True)
         self.retry_timer.timeout.connect(self._retry_now)
+
+        # Queued connection (default for cross-thread emit) is what makes
+        # the libVLC-thread -> GUI-thread handoff safe.
+        self.state_event.connect(self._on_state_event)
 
         QTimer.singleShot(0, self._ensure_player)
 
@@ -291,15 +242,7 @@ class PlayerPane(QWidget):
             self.frame.setStyleSheet("background: black; border: 3px solid #333;")
 
     def _bind_player_window(self, player: vlc.MediaPlayer):
-        wid = int(self.frame.winId())
-        if sys.platform.startswith("linux"):
-            player.set_xwindow(wid)
-        elif sys.platform.startswith("win"):
-            player.set_hwnd(wid)
-        elif sys.platform.startswith("darwin"):
-            player.set_nsobject(wid)
-        else:
-            player.set_xwindow(wid)
+        bind_player_to_window(player, int(self.frame.winId()))
 
     def _detach_player_window(self):
         """Tell libVLC to stop drawing into our QFrame, but keep the player
@@ -308,14 +251,9 @@ class PlayerPane(QWidget):
         if self.player is None:
             return
         try:
-            if sys.platform.startswith("linux"):
-                self.player.set_xwindow(0)
-            elif sys.platform.startswith("win"):
-                self.player.set_hwnd(0)
-            elif sys.platform.startswith("darwin"):
-                self.player.set_nsobject(0)
+            bind_player_to_window(self.player, 0)
         except Exception:
-            pass
+            log.exception("pane %d: detach window failed", self.pane_id)
 
     def rebind_to_current_frame(self):
         """Re-attach the live player to the (possibly fresh) QFrame winId
@@ -327,9 +265,40 @@ class PlayerPane(QWidget):
         except Exception:
             pass
 
+    # ---- event wiring ----
+
+    # Map vlc.EventType -> short name string carried in the Qt signal.
+    _EVENT_MAP = {
+        vlc.EventType.MediaPlayerOpening:          "opening",
+        vlc.EventType.MediaPlayerBuffering:        "buffering",
+        vlc.EventType.MediaPlayerPlaying:          "playing",
+        vlc.EventType.MediaPlayerPaused:           "paused",
+        vlc.EventType.MediaPlayerStopped:          "stopped",
+        vlc.EventType.MediaPlayerEndReached:       "ended",
+        vlc.EventType.MediaPlayerEncounteredError: "error",
+        vlc.EventType.MediaPlayerTimeChanged:      "time",
+    }
+
+    def _wire_player_events(self, player, gen):
+        em = player.event_manager()
+        for ev_type, name in self._EVENT_MAP.items():
+            # Default args bake the current name + gen into the closure so the
+            # callback can be called from any thread without surprises.
+            def _cb(_event, _name=name, _gen=gen):
+                try:
+                    self.state_event.emit(_name, _gen)
+                except Exception:
+                    pass
+            try:
+                em.event_attach(ev_type, _cb)
+            except Exception:
+                log.exception("pane %d: event_attach failed for %s", self.pane_id, name)
+
     def _new_player(self) -> vlc.MediaPlayer:
         p = self.vlc.media_player_new()
         self._bind_player_window(p)
+        self._player_gen += 1
+        self._wire_player_events(p, self._player_gen)
         return p
 
     def _ensure_player(self):
@@ -352,15 +321,16 @@ class PlayerPane(QWidget):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
-        if self.poll_timer.isActive():
-            self.poll_timer.stop()
+        if self.watchdog_timer.isActive():
+            self.watchdog_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
         self.player = self._new_player()
         self.assigned_channel = None
         self._retry_attempt = 0
         self._opening_since_ts = 0.0
-        self._last_playing_ts = 0.0
+        self._last_progress_ts = 0.0
+        self._is_playing = False
         self.label.setText(f"Pane {self.pane_id}: Idle")
 
     def play_channel(self, ch: int):
@@ -373,13 +343,8 @@ class PlayerPane(QWidget):
         # Idempotent: already playing this exact channel and the player is in
         # a healthy state -> no-op.  Avoids the wasteful "kill the player and
         # start over" cycle on every double-press of a channel button.
-        if self.assigned_channel == ch and self.player is not None:
-            try:
-                st = self.player.get_state()
-            except Exception:
-                st = vlc.State.Error
-            if st in (vlc.State.Playing, vlc.State.Opening, vlc.State.Buffering):
-                return
+        if self.assigned_channel == ch and self.player is not None and self._is_playing:
+            return
 
         self._ensure_player()
         self._cancel_retry()
@@ -388,11 +353,12 @@ class PlayerPane(QWidget):
         self.assigned_channel = ch
         now = time.monotonic()
         self._opening_since_ts = now
-        self._last_playing_ts = 0.0
+        self._last_progress_ts = 0.0
+        self._is_playing = False
 
         self._start_play(ch, reason="play")
-        if not self.poll_timer.isActive():
-            self.poll_timer.start()
+        if not self.watchdog_timer.isActive():
+            self.watchdog_timer.start()
 
     def _start_play(self, ch: int, reason: str):
         p = self._swap_player()
@@ -422,8 +388,10 @@ class PlayerPane(QWidget):
         try:
             p.play()
         except Exception:
-            pass
+            log.exception("pane %d: MediaPlayer.play() raised", self.pane_id)
 
+        log.info("pane %d: opening CH%d (%s) url=%s",
+                 self.pane_id, ch, reason, url)
         self.label.setText(f"Pane {self.pane_id}: Opening {self.cfg.channel_text(ch)} ({reason})")
         self.open_timer.start(self.cfg.open_timeout_ms)
 
@@ -436,6 +404,8 @@ class PlayerPane(QWidget):
         delay = min(self.cfg.retry_max_ms, self.cfg.retry_base_ms * (2 ** max(0, self._retry_attempt - 1)))
         ch = self.assigned_channel
         self.label.setText(f"Pane {self.pane_id}: {self.cfg.channel_text(ch)} lost ({why}), retry in {delay}ms")
+        log.warning("pane %d: CH%d retry#%d in %dms (%s)",
+                    self.pane_id, ch, self._retry_attempt, delay, why)
         self.retry_timer.start(delay)
 
     def _retry_now(self):
@@ -446,19 +416,19 @@ class PlayerPane(QWidget):
         self._opening_since_ts = time.monotonic()
         self._start_play(ch, reason=f"retry#{self._retry_attempt}")
 
-    def _poll_state(self):
-        if self.player is None or self.assigned_channel is None:
+    def _on_state_event(self, name: str, gen: int):
+        """Slot — runs on the GUI thread.  libVLC event callbacks emit
+        state_event from libVLC threads; queued connection delivers it here."""
+        # Stale event from a swapped-out / disposed player — ignore.
+        if gen != self._player_gen or self.assigned_channel is None:
             return
+
         ch = self.assigned_channel
         now = time.monotonic()
 
-        try:
-            st = self.player.get_state()
-        except Exception:
-            st = vlc.State.Error
-
-        if st == vlc.State.Playing:
-            self._last_playing_ts = now
+        if name == "playing":
+            self._is_playing = True
+            self._last_progress_ts = now
             self._opening_since_ts = 0.0
             self._retry_attempt = 0
             if self.open_timer.isActive():
@@ -466,37 +436,51 @@ class PlayerPane(QWidget):
             self.label.setText(f"Pane {self.pane_id}: {self.cfg.channel_text(ch)} playing")
             return
 
-        if st in (vlc.State.Opening, vlc.State.Buffering):
-            if self._opening_since_ts > 0.0:
-                if (now - self._opening_since_ts) * 1000.0 > self.cfg.stall_timeout_ms:
-                    self._schedule_retry("stall(opening/buffering)")
+        if name == "time":
+            # Forward-progress heartbeat — fires whenever the player advances.
+            self._last_progress_ts = now
             return
 
-        if st in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
-            self._schedule_retry(f"state={st}")
+        if name in ("opening", "buffering"):
+            self.label.setText(f"Pane {self.pane_id}: {self.cfg.channel_text(ch)} {name}")
             return
 
-        # other non-playing; if we were playing before and now stalled too long
-        if self._last_playing_ts > 0.0:
-            if (now - self._last_playing_ts) * 1000.0 > self.cfg.stall_timeout_ms:
-                self._schedule_retry(f"stall(state={st})")
+        if name in ("error", "ended", "stopped"):
+            self._is_playing = False
+            self._schedule_retry(f"event={name}")
+            return
+
+        # paused: just track the flag, no action
+        if name == "paused":
+            self._is_playing = False
+
+    def _watchdog_tick(self):
+        """Catches the silent-stall case: libVLC isn't firing time events
+        even though we believed it was Playing.  All other state transitions
+        come from libVLC events, not from this timer."""
+        if self.player is None or self.assigned_channel is None:
+            return
+        if not self._is_playing:
+            return
+        if self._last_progress_ts <= 0.0:
+            return
+        now = time.monotonic()
+        if (now - self._last_progress_ts) * 1000.0 > self.cfg.stall_timeout_ms:
+            self._is_playing = False
+            self._schedule_retry("watchdog(no progress)")
 
     def _open_timeout(self):
         if self.player is None or self.assigned_channel is None:
             return
-        try:
-            st = self.player.get_state()
-        except Exception:
-            st = vlc.State.Error
-        if st != vlc.State.Playing:
+        if not self._is_playing:
             self._schedule_retry("open-timeout")
 
     def shutdown(self):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
-        if self.poll_timer.isActive():
-            self.poll_timer.stop()
+        if self.watchdog_timer.isActive():
+            self.watchdog_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None
@@ -800,8 +784,11 @@ class MainWindow(QMainWindow):
     def set_active_pane(self, pane_id: int):
         if pane_id > self.visible_panes:
             pane_id = 1
+        if self.active_pane == pane_id:
+            return
         self.active_pane = pane_id
         self._update_focus()
+        self._save_state()
 
     def _grid_dims(self, n: int):
         """Pick (rows, cols) for n tiles, honouring self.split_orientation.
@@ -920,12 +907,16 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         self._apply_panes_visibility(n)
+        self._save_state()
 
     def on_channel_pressed(self, ch: int):
+        log.info("user: assign CH%d -> pane %d", ch, self.active_pane)
         self.panes[self.active_pane - 1].play_channel(ch)
+        self._save_state()
 
     def clear_active_pane(self):
         self.panes[self.active_pane - 1].stop_to_idle()
+        self._save_state()
 
     def apply_selected_view(self):
         name = self.cmb_views.currentText().strip()
@@ -934,6 +925,7 @@ class MainWindow(QMainWindow):
         v = self.views.get(name)
         if not isinstance(v, dict):
             return
+        log.info("user: apply view %r", name)
         panes = int(v.get("panes", 4))
         assign = v.get("assign", [])
         self.cmb_panes.setCurrentText(str(panes))
@@ -947,6 +939,7 @@ class MainWindow(QMainWindow):
                 p.play_channel(ch)
             else:
                 p.stop_to_idle()
+        self._save_state()
 
     def save_view_dialog(self):
         name, ok = QInputDialog.getText(self, "Save View", "View name:")
@@ -986,6 +979,7 @@ class MainWindow(QMainWindow):
         if self._cleaned:
             return
         self._cleaned = True
+        log.info("shutting down")
         self._save_state()
         for p in self.panes:
             p.shutdown()
@@ -995,7 +989,8 @@ class MainWindow(QMainWindow):
         try:
             self.vlc.release()
         except Exception:
-            pass
+            log.exception("vlc.Instance.release() raised")
+        log.info("shutdown complete")
 
     def closeEvent(self, event):
         self.cleanup()
@@ -1014,6 +1009,16 @@ def install_sigint_handler(window: MainWindow):
 
 
 if __name__ == "__main__":
+    # Configure logging from rtsp.ini *before* anything else so early
+    # failures (missing libVLC, broken config) end up in the log too.
+    try:
+        _early_cfg = RtspConfig("rtsp.ini")
+        setup_logging(_early_cfg.log_level, _early_cfg.log_file)
+    except Exception:
+        setup_logging("INFO", "")
+        log.exception("Failed to read rtsp.ini for early logging setup")
+    log.info("RTSPMatrix starting")
+
     app = QApplication(sys.argv)
     w = MainWindow()
     app.aboutToQuit.connect(w.cleanup)
