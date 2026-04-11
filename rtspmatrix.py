@@ -95,9 +95,45 @@ class RtspConfig:
         self.views_file = a.get("views_file", "views.json")
         self.state_file = a.get("state_file", "state.json")
 
+        raw_labels = cp["view"].get("labels", "") if cp.has_section("view") else ""
+        self.labels = self._parse_labels(raw_labels)
+
     def url(self, channel: int) -> str:
         ch = max(1, min(16, int(channel)))
         return f"rtsp://{self.host}:{self.port}{self.path}?channel={ch}&subtype={self.subtype}"
+
+    @staticmethod
+    def _parse_labels(raw: str) -> list:
+        """Parse `labels = { A, B, C, ... }` into a 16-entry list (None for missing)."""
+        if not raw:
+            return [None] * 16
+        s = raw.strip()
+        if s.startswith("{"):
+            s = s[1:]
+        if s.endswith("}"):
+            s = s[:-1]
+        parts = [p.strip() for p in s.split(",")]
+        parts = [p for p in parts if p != ""]
+        return [parts[i] if i < len(parts) else None for i in range(16)]
+
+    def label_for(self, ch):
+        try:
+            ch = int(ch)
+        except Exception:
+            return None
+        if 1 <= ch <= 16:
+            return self.labels[ch - 1]
+        return None
+
+    def is_channel_active(self, ch) -> bool:
+        lbl = self.label_for(ch)
+        return lbl is not None and lbl != "BRAK"
+
+    def channel_text(self, ch) -> str:
+        lbl = self.label_for(ch)
+        if lbl and lbl != "BRAK":
+            return f"CH{int(ch)} {lbl}"
+        return f"CH{int(ch)}"
 
 
 # ---------- views ----------
@@ -250,6 +286,10 @@ class PlayerPane(QWidget):
         self._ensure_player()
         ch = int(max(1, min(16, ch)))
 
+        if not self.cfg.is_channel_active(ch):
+            self.stop_to_idle()
+            return
+
         self._cancel_retry()
         self._retry_attempt = 0
 
@@ -292,7 +332,7 @@ class PlayerPane(QWidget):
         except Exception:
             pass
 
-        self.label.setText(f"Pane {self.pane_id}: Opening CH{ch} ({reason})")
+        self.label.setText(f"Pane {self.pane_id}: Opening {self.cfg.channel_text(ch)} ({reason})")
         self.open_timer.start(self.cfg.open_timeout_ms)
 
     def _schedule_retry(self, why: str):
@@ -303,7 +343,7 @@ class PlayerPane(QWidget):
 
         delay = min(self.cfg.retry_max_ms, self.cfg.retry_base_ms * (2 ** max(0, self._retry_attempt - 1)))
         ch = self.assigned_channel
-        self.label.setText(f"Pane {self.pane_id}: CH{ch} lost ({why}), retry in {delay}ms")
+        self.label.setText(f"Pane {self.pane_id}: {self.cfg.channel_text(ch)} lost ({why}), retry in {delay}ms")
         self.retry_timer.start(delay)
 
     def _retry_now(self):
@@ -331,7 +371,7 @@ class PlayerPane(QWidget):
             self._retry_attempt = 0
             if self.open_timer.isActive():
                 self.open_timer.stop()
-            self.label.setText(f"Pane {self.pane_id}: CH{ch} playing")
+            self.label.setText(f"Pane {self.pane_id}: {self.cfg.channel_text(ch)} playing")
             return
 
         if st in (vlc.State.Opening, vlc.State.Buffering):
@@ -475,11 +515,18 @@ class MainWindow(QMainWindow):
         grid_btn = QGridLayout()
         grid_btn.setSpacing(6)
         for i, ch in enumerate(range(1, 17)):
-            b = QPushButton(str(ch), self)
-            b.setMinimumHeight(34)
-            b.setMinimumWidth(48)
+            lbl = self.cfg.label_for(ch)
+            text = f"{ch}\n{lbl}" if lbl else str(ch)
+            b = QPushButton(text, self)
+            b.setMinimumHeight(46)
+            b.setMinimumWidth(110)
+            if not self.cfg.is_channel_active(ch):
+                b.setEnabled(False)
+                b.setToolTip(f"CH{ch}: no camera")
             self.btn_channels.addButton(b, ch)
             grid_btn.addWidget(b, i // 8, i % 8)
+        for c in range(8):
+            grid_btn.setColumnStretch(c, 1)
         main.addLayout(grid_btn)
 
         controls = QHBoxLayout()
@@ -576,9 +623,9 @@ class MainWindow(QMainWindow):
         if isinstance(assign, list):
             for i in range(min(16, len(assign))):
                 ch = assign[i]
-                if isinstance(ch, int) and 1 <= ch <= 16:
+                if isinstance(ch, int) and 1 <= ch <= 16 and self.cfg.is_channel_active(ch):
                     self.panes[i].assigned_channel = ch
-                    self.panes[i].label.setText(f"Pane {i+1}: CH{ch} (saved)")
+                    self.panes[i].label.setText(f"Pane {i+1}: {self.cfg.channel_text(ch)} (saved)")
                 else:
                     self.panes[i].assigned_channel = None
                     self.panes[i].label.setText(f"Pane {i+1}: Idle")
