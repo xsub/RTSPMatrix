@@ -146,10 +146,19 @@ class ViewsStore:
 
 class ClickableFrame(QFrame):
     clicked = pyqtSignal()
+    doubleClicked = pyqtSignal()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class PlayerPane(QWidget):
@@ -169,12 +178,20 @@ class PlayerPane(QWidget):
     # older generation and the slot drops them.
     state_event = pyqtSignal(str, int)
 
-    def __init__(self, pane_id: int, vlc_instance: vlc.Instance, cfg: RtspConfig, on_focus):
+    def __init__(self, pane_id: int, vlc_instance: vlc.Instance, cfg: RtspConfig,
+                 on_focus, on_dblclick=None):
         super().__init__()
         self.pane_id = pane_id
         self.vlc = vlc_instance
         self.cfg = cfg
         self.on_focus = on_focus
+        self.on_dblclick = on_dblclick
+
+        # When non-None, _bind_player_window targets this winId instead of
+        # self.frame.winId().  Used by the fullscreen feature so retries that
+        # land while we're in fullscreen create a new player bound to the
+        # fullscreen surface, not the hidden tile.
+        self._external_winid = None
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -188,6 +205,7 @@ class PlayerPane(QWidget):
         # this, every player can end up rendering on top of every other.
         self.frame.setAttribute(Qt.WA_NativeWindow, True)
         self.frame.clicked.connect(self._clicked)
+        self.frame.doubleClicked.connect(self._dblclicked)
 
         self.label = QLabel(f"Pane {pane_id}: Idle", self)
         self.label.setStyleSheet("color: #ddd;")
@@ -235,6 +253,10 @@ class PlayerPane(QWidget):
     def _clicked(self):
         self.on_focus(self.pane_id)
 
+    def _dblclicked(self):
+        if self.on_dblclick is not None:
+            self.on_dblclick(self.pane_id)
+
     def set_focused(self, focused: bool):
         if focused:
             self.frame.setStyleSheet("background: black; border: 3px solid #66aaff;")
@@ -242,7 +264,11 @@ class PlayerPane(QWidget):
             self.frame.setStyleSheet("background: black; border: 3px solid #333;")
 
     def _bind_player_window(self, player: vlc.MediaPlayer):
-        bind_player_to_window(player, int(self.frame.winId()))
+        if self._external_winid is not None:
+            wid = int(self._external_winid)
+        else:
+            wid = int(self.frame.winId())
+        bind_player_to_window(player, wid)
 
     def _detach_player_window(self):
         """Tell libVLC to stop drawing into our QFrame, but keep the player
@@ -486,6 +512,44 @@ class PlayerPane(QWidget):
             self.player = None
 
 
+class FullScreenWindow(QMainWindow):
+    """Borderless single-tile fullscreen viewer.
+
+    Holds a single QFrame with WA_NativeWindow set, so its winId() is a
+    real OS-level handle that libVLC can render into.  Closes on any key
+    press (per user spec) or on a left mouse click.
+    """
+    closed = pyqtSignal()
+
+    def __init__(self, parent, title: str):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        # Frameless + always-on-top so the user truly sees just the video.
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        v = QVBoxLayout(root)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        self.video = ClickableFrame(self)
+        self.video.setStyleSheet("background: black;")
+        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video.setAttribute(Qt.WA_NativeWindow, True)
+        self.video.clicked.connect(self.close)
+        v.addWidget(self.video, 1)
+
+    def keyPressEvent(self, event):
+        # Per spec: any key exits.  Even pure modifier presses count.
+        self.close()
+        event.accept()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 ABOUT_LOGO_CANDIDATES = (
     "RTSPMatrix_logo.png",
     os.path.join("assets", "RTSPMatrix_logo.png"),
@@ -697,10 +761,15 @@ class MainWindow(QMainWindow):
         self.panes_grid.setSpacing(8)
         main.addLayout(self.panes_grid, 1)
 
-        self.panes = [PlayerPane(pid, self.vlc, self.cfg, self.set_active_pane)
+        self.panes = [PlayerPane(pid, self.vlc, self.cfg,
+                                 self.set_active_pane,
+                                 on_dblclick=self.open_fullscreen_for_pane)
                       for pid in range(1, 17)]
         self.grid_rows = 0
         self.grid_cols = 0
+
+        self.fullscreen = None  # active FullScreenWindow, or None
+        self.fullscreen_pane_id = None
 
         self.active_pane = 1
         # Start at 0 so the first _apply_panes_visibility call treats every
@@ -790,6 +859,80 @@ class MainWindow(QMainWindow):
         self._update_focus()
         self._save_state()
 
+    # ---------- fullscreen ----------
+
+    def open_fullscreen_for_pane(self, pane_id: int):
+        """Double-click handler.  Drawable-rebinds the pane's live player
+        onto a borderless fullscreen window — no reconnect, no media reload.
+        Closing the window (any key, click, Escape) rebinds back to the tile."""
+        if self.fullscreen is not None:
+            return
+        if not (1 <= pane_id <= self.visible_panes):
+            return
+        pane = self.panes[pane_id - 1]
+        if pane.player is None or pane.assigned_channel is None:
+            return  # nothing to show
+
+        log.info("user: open fullscreen for pane %d (CH%d)",
+                 pane_id, pane.assigned_channel)
+
+        fs = FullScreenWindow(self, self.cfg.title)
+        fs.closed.connect(lambda: self._on_fullscreen_closed(pane_id))
+        self.fullscreen = fs
+        self.fullscreen_pane_id = pane_id
+
+        # Detach the live player from the tile, then redirect every future
+        # binding (including any retry-driven _swap_player) at the fullscreen
+        # surface via _external_winid.
+        pane._detach_player_window()
+        fs.showFullScreen()
+
+        # Defer the bind by one tick so the window is fully mapped first —
+        # otherwise winId() can come back as 0 on macOS.
+        def _do_bind():
+            if self.fullscreen is not fs:
+                return
+            wid = int(fs.video.winId())
+            pane._external_winid = wid
+            try:
+                pane._bind_player_window(pane.player)
+            except Exception:
+                log.exception("fullscreen bind failed")
+        QTimer.singleShot(0, _do_bind)
+
+    def _on_fullscreen_closed(self, pane_id: int):
+        if self.fullscreen is None:
+            return
+        log.info("user: close fullscreen (pane %d)", pane_id)
+        pane = self.panes[pane_id - 1]
+        # Drop the override and rebind to the tile.  rebind_to_current_frame
+        # forces a fresh winId() allocation if the tile lost its native
+        # window while it was hidden behind the fullscreen.
+        pane._external_winid = None
+        try:
+            pane._detach_player_window()
+        except Exception:
+            log.exception("fullscreen detach failed")
+        try:
+            _ = int(pane.frame.winId())
+        except Exception:
+            pass
+        try:
+            pane.rebind_to_current_frame()
+        except Exception:
+            log.exception("rebind to tile failed")
+        self.fullscreen = None
+        self.fullscreen_pane_id = None
+        self._update_focus()
+
+    def _close_fullscreen_if_any(self):
+        if self.fullscreen is None:
+            return
+        try:
+            self.fullscreen.close()
+        except Exception:
+            log.exception("fullscreen close failed")
+
     def _grid_dims(self, n: int):
         """Pick (rows, cols) for n tiles, honouring self.split_orientation.
 
@@ -867,6 +1010,11 @@ class MainWindow(QMainWindow):
         prev = self.visible_panes
         self.visible_panes = n
 
+        # Layout reshuffling and a live fullscreen rebind don't mix — close
+        # any open fullscreen first so the tile rebinds happen on a clean
+        # slate.
+        self._close_fullscreen_if_any()
+
         # Stop streams that just disappeared (saves bandwidth + decode CPU).
         for i in range(n, prev):
             self.panes[i].stop_to_idle()
@@ -893,6 +1041,7 @@ class MainWindow(QMainWindow):
             self.btn_orient.setToolTip("Layout: stacked  (click for side-by-side)")
 
     def toggle_orientation(self):
+        self._close_fullscreen_if_any()
         self.split_orientation = (
             "vertical" if self.split_orientation == "horizontal" else "horizontal"
         )
@@ -980,6 +1129,7 @@ class MainWindow(QMainWindow):
             return
         self._cleaned = True
         log.info("shutting down")
+        self._close_fullscreen_if_any()
         self._save_state()
         for p in self.panes:
             p.shutdown()
