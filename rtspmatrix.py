@@ -503,6 +503,8 @@ class PlayerPane(QWidget):
 
 
 ABOUT_LOGO_CANDIDATES = (
+    "RTSPMatrix_logo.png",
+    os.path.join("assets", "RTSPMatrix_logo.png"),
     "puffy-clouds-logo.png",
     os.path.join("assets", "puffy-clouds-logo.png"),
 )
@@ -525,28 +527,35 @@ class AboutDialog(QDialog):
         v.setContentsMargins(16, 16, 16, 12)
         v.setSpacing(12)
 
-        # ---- branding header (Puffy Clouds logo) ----
+        # ---- branding header ----
         logo_path = _find_about_logo()
+        logo_is_rtspmatrix = bool(logo_path and "RTSPMatrix_logo" in logo_path)
         if logo_path:
             pm = QPixmap(logo_path)
             if not pm.isNull():
-                # Scale to a fixed display width; the source is 1920x753.
-                scaled = pm.scaledToWidth(480, Qt.SmoothTransformation)
+                scaled = pm.scaledToWidth(560, Qt.SmoothTransformation)
                 logo = QLabel(self)
                 logo.setPixmap(scaled)
                 logo.setAlignment(Qt.AlignCenter)
-                logo.setStyleSheet("background: white; padding: 12px; border-radius: 6px;")
+                # The RTSPMatrix logo ships with its own dark background and
+                # baked-in title; don't put it on a white card.  The Puffy
+                # Clouds fallback is dark-on-white, so it gets the card.
+                if not logo_is_rtspmatrix:
+                    logo.setStyleSheet("background: white; padding: 12px; border-radius: 6px;")
                 v.addWidget(logo, 0, Qt.AlignCenter)
 
-        title = QLabel(f"<h2 style='margin:0'>{cfg.title}</h2>", self)
-        title.setAlignment(Qt.AlignCenter)
-        v.addWidget(title)
+        # The RTSPMatrix logo already renders the app name + tagline.  For
+        # the fallback (Puffy Clouds) we still need an explicit title row.
+        if not logo_is_rtspmatrix:
+            title = QLabel(f"<h2 style='margin:0'>{cfg.title}</h2>", self)
+            title.setAlignment(Qt.AlignCenter)
+            v.addWidget(title)
 
-        subtitle = QLabel("RTSP grid viewer for Dahua / compatible DVR-NVR devices",
-                          self)
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet("color: #aaa;")
-        v.addWidget(subtitle)
+            subtitle = QLabel("RTSP grid viewer for Dahua / compatible DVR-NVR devices",
+                              self)
+            subtitle.setAlignment(Qt.AlignCenter)
+            subtitle.setStyleSheet("color: #aaa;")
+            v.addWidget(subtitle)
 
         # ---- runtime / config info ----
         text = QTextEdit(self)
