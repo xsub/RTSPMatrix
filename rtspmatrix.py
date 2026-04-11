@@ -19,7 +19,7 @@ import importlib.metadata
 
 import vlc
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
-from PyQt5.QtGui import QGuiApplication
+from PyQt5.QtGui import QGuiApplication, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QSizePolicy,
@@ -502,14 +502,56 @@ class PlayerPane(QWidget):
             self.player = None
 
 
+ABOUT_LOGO_CANDIDATES = (
+    "puffy-clouds-logo.png",
+    os.path.join("assets", "puffy-clouds-logo.png"),
+)
+
+
+def _find_about_logo():
+    for p in ABOUT_LOGO_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 class AboutDialog(QDialog):
     def __init__(self, parent, cfg: RtspConfig, panes: int):
         super().__init__(parent)
         self.setWindowTitle("About RTSPMatrix")
-        self.resize(720, 520)
+        self.resize(720, 620)
 
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 12)
+        v.setSpacing(12)
+
+        # ---- branding header (Puffy Clouds logo) ----
+        logo_path = _find_about_logo()
+        if logo_path:
+            pm = QPixmap(logo_path)
+            if not pm.isNull():
+                # Scale to a fixed display width; the source is 1920x753.
+                scaled = pm.scaledToWidth(480, Qt.SmoothTransformation)
+                logo = QLabel(self)
+                logo.setPixmap(scaled)
+                logo.setAlignment(Qt.AlignCenter)
+                logo.setStyleSheet("background: white; padding: 12px; border-radius: 6px;")
+                v.addWidget(logo, 0, Qt.AlignCenter)
+
+        title = QLabel(f"<h2 style='margin:0'>{cfg.title}</h2>", self)
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title)
+
+        subtitle = QLabel("RTSP grid viewer for Dahua / compatible DVR-NVR devices",
+                          self)
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("color: #aaa;")
+        v.addWidget(subtitle)
+
+        # ---- runtime / config info ----
         text = QTextEdit(self)
         text.setReadOnly(True)
+        text.setStyleSheet("font-family: monospace; font-size: 11px;")
 
         py_ver = sys.version.replace("\n", " ")
         qt_ver = QT_VERSION_STR
@@ -557,7 +599,9 @@ class AboutDialog(QDialog):
 
         content = "\n".join(info)
         text.setPlainText(content)
+        v.addWidget(text, 1)
 
+        # ---- buttons ----
         btn_copy = QPushButton("Copy", self)
         btn_close = QPushButton("Close", self)
         btn_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(content))
@@ -567,9 +611,6 @@ class AboutDialog(QDialog):
         row.addStretch(1)
         row.addWidget(btn_copy)
         row.addWidget(btn_close)
-
-        v = QVBoxLayout(self)
-        v.addWidget(text, 1)
         v.addLayout(row)
 
 
