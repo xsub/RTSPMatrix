@@ -925,24 +925,40 @@ class MainWindow(QMainWindow):
             return
         log.info("user: close fullscreen (pane %d)", pane_id)
         pane = self.panes[pane_id - 1]
-        # Drop the override and rebind to the tile.  rebind_to_current_frame
-        # forces a fresh winId() allocation if the tile lost its native
-        # window while it was hidden behind the fullscreen.
+
+        # Drop the override so any future bind targets the tile frame.  Do
+        # NOT call _detach_player_window here: detaching first leaves the
+        # player in a transient "no drawable" state from which set_nsobject
+        # to the new surface does not reliably recover on macOS.
         pane._external_winid = None
-        try:
-            pane._detach_player_window()
-        except Exception:
-            log.exception("fullscreen detach failed")
-        try:
-            _ = int(pane.frame.winId())
-        except Exception:
-            pass
-        try:
-            pane.rebind_to_current_frame()
-        except Exception:
-            log.exception("rebind to tile failed")
         self.fullscreen = None
         self.fullscreen_pane_id = None
+
+        # Bring the main window back — closing the fullscreen NSWindow on
+        # macOS does not automatically restore focus to the underlying app
+        # window, so the user otherwise sees their desktop / another app.
+        try:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            log.exception("main window raise failed")
+
+        # Defer the rebind so the main window has had an event-loop tick
+        # to actually become visible / focused, and the tile's NSView is
+        # back on screen.  Re-querying winId() inside the deferred call
+        # forces fresh allocation if the handle was invalidated while the
+        # tile was hidden behind the fullscreen.
+        def _do_rebind():
+            if pane.player is None:
+                return
+            try:
+                _ = int(pane.frame.winId())
+                pane._bind_player_window(pane.player)
+            except Exception:
+                log.exception("rebind to tile failed")
+        QTimer.singleShot(0, _do_rebind)
+
         self._update_focus()
 
     def _close_fullscreen_if_any(self):
