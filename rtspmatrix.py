@@ -150,7 +150,13 @@ class ClickableFrame(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # Accept + return so we never call super().mousePressEvent on a
+            # widget that may have been destroyed by the connected slot
+            # (e.g. clicked -> close() -> Qt destroys this frame), which
+            # otherwise raises "wrapped C/C++ object has been deleted".
             self.clicked.emit()
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -542,13 +548,18 @@ class FullScreenWindow(QMainWindow):
         # handle so libVLC binds to the video area specifically, not to the
         # whole QMainWindow.
         self.video.setAttribute(Qt.WA_NativeWindow, True)
-        self.video.clicked.connect(self.close)
+        # Defer the close so the mousePressEvent stack can fully unwind
+        # before Qt starts tearing down the video widget.  Otherwise the
+        # super().mousePressEvent in ClickableFrame would land on a freed
+        # C++ object.
+        self.video.clicked.connect(lambda: QTimer.singleShot(0, self.close))
         v.addWidget(self.video, 1)
 
     def keyPressEvent(self, event):
         # Per spec: any key exits.  Even pure modifier presses count.
-        self.close()
+        # Defer for the same reason the click handler does.
         event.accept()
+        QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event):
         self.closed.emit()
@@ -887,42 +898,27 @@ class MainWindow(QMainWindow):
         self.fullscreen = fs
         self.fullscreen_pane_id = pane_id
 
-        # 1) Realise the window and force its native handles so winId() is
-        #    valid before we hand it to libVLC.  show() must come before
-        #    showFullScreen() on macOS, otherwise the NSWindow isn't mapped
-        #    yet and winId() returns a stale value.
-        fs.show()
-        fs.raise_()
-        fs.activateWindow()
-        _ = int(fs.winId())
-        wid = int(fs.video.winId())
+        # Match the virtual variant exactly: showFullScreen first, capture
+        # winId immediately (the show forces native handle allocation), then
+        # defer the actual VLC bind by one event-loop tick so the NSView /
+        # XWindow / HWND is fully realised before libVLC takes it.  No
+        # explicit detach — set_nsobject(new) is enough to switch surfaces;
+        # detaching first leaves a transient "no drawable" state that on
+        # macOS can leave the player stuck rendering nothing.
         fs.showFullScreen()
+        wid_snap = int(fs.video.winId())
 
-        # 2) Move the player drawable from the tile to the fullscreen video
-        #    surface.  Setting _external_winid first means any retry-driven
-        #    _swap_player binds the replacement player to the fullscreen
-        #    surface rather than the (hidden) tile.
-        pane._external_winid = wid
-        pane._detach_player_window()
-        try:
-            pane._bind_player_window(pane.player)
-        except Exception:
-            log.exception("fullscreen initial bind failed")
-
-        # 3) After one event-loop tick, rebind once more.  On macOS the very
-        #    first bind right after showFullScreen() can land before the
-        #    NSView is fully realised; the redundant rebind picks up the
-        #    final winId.  Cheap, idempotent.
-        def _rebind_after_show():
+        def _do_bind():
             if self.fullscreen is not fs:
                 return
+            if pane.player is None:
+                return
             try:
-                wid2 = int(fs.video.winId())
-                pane._external_winid = wid2
+                pane._external_winid = wid_snap
                 pane._bind_player_window(pane.player)
             except Exception:
-                log.exception("fullscreen rebind tick failed")
-        QTimer.singleShot(0, _rebind_after_show)
+                log.exception("fullscreen bind failed")
+        QTimer.singleShot(0, _do_bind)
 
     def _on_fullscreen_closed(self, pane_id: int):
         if self.fullscreen is None:
