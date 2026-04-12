@@ -513,7 +513,7 @@ class PlayerPane(QWidget):
 
 
 class FullScreenWindow(QMainWindow):
-    """Borderless single-tile fullscreen viewer.
+    """Single-tile fullscreen viewer.
 
     Holds a single QFrame with WA_NativeWindow set, so its winId() is a
     real OS-level handle that libVLC can render into.  Closes on any key
@@ -521,11 +521,13 @@ class FullScreenWindow(QMainWindow):
     """
     closed = pyqtSignal()
 
-    def __init__(self, parent, title: str):
-        super().__init__(parent)
+    def __init__(self, title: str):
+        # IMPORTANT: do NOT pass a Qt parent here.  Passing the MainWindow as
+        # parent turns this into a Cocoa child window on macOS, which never
+        # gets its own NSWindow and therefore won't render any libVLC frames.
+        # Same trick the virtual variant uses (rtspmatrix-vitual.py).
+        super().__init__()
         self.setWindowTitle(title)
-        # Frameless + always-on-top so the user truly sees just the video.
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -536,6 +538,9 @@ class FullScreenWindow(QMainWindow):
         self.video = ClickableFrame(self)
         self.video.setStyleSheet("background: black;")
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # WA_NativeWindow gives this child widget its own OS-level window
+        # handle so libVLC binds to the video area specifically, not to the
+        # whole QMainWindow.
         self.video.setAttribute(Qt.WA_NativeWindow, True)
         self.video.clicked.connect(self.close)
         v.addWidget(self.video, 1)
@@ -863,7 +868,7 @@ class MainWindow(QMainWindow):
 
     def open_fullscreen_for_pane(self, pane_id: int):
         """Double-click handler.  Drawable-rebinds the pane's live player
-        onto a borderless fullscreen window — no reconnect, no media reload.
+        onto a single-tile fullscreen window — no reconnect, no media reload.
         Closing the window (any key, click, Escape) rebinds back to the tile."""
         if self.fullscreen is not None:
             return
@@ -876,29 +881,48 @@ class MainWindow(QMainWindow):
         log.info("user: open fullscreen for pane %d (CH%d)",
                  pane_id, pane.assigned_channel)
 
-        fs = FullScreenWindow(self, self.cfg.title)
+        # Top-level FullScreenWindow with no Qt parent (see class docstring).
+        fs = FullScreenWindow(self.cfg.title)
         fs.closed.connect(lambda: self._on_fullscreen_closed(pane_id))
         self.fullscreen = fs
         self.fullscreen_pane_id = pane_id
 
-        # Detach the live player from the tile, then redirect every future
-        # binding (including any retry-driven _swap_player) at the fullscreen
-        # surface via _external_winid.
-        pane._detach_player_window()
+        # 1) Realise the window and force its native handles so winId() is
+        #    valid before we hand it to libVLC.  show() must come before
+        #    showFullScreen() on macOS, otherwise the NSWindow isn't mapped
+        #    yet and winId() returns a stale value.
+        fs.show()
+        fs.raise_()
+        fs.activateWindow()
+        _ = int(fs.winId())
+        wid = int(fs.video.winId())
         fs.showFullScreen()
 
-        # Defer the bind by one tick so the window is fully mapped first —
-        # otherwise winId() can come back as 0 on macOS.
-        def _do_bind():
+        # 2) Move the player drawable from the tile to the fullscreen video
+        #    surface.  Setting _external_winid first means any retry-driven
+        #    _swap_player binds the replacement player to the fullscreen
+        #    surface rather than the (hidden) tile.
+        pane._external_winid = wid
+        pane._detach_player_window()
+        try:
+            pane._bind_player_window(pane.player)
+        except Exception:
+            log.exception("fullscreen initial bind failed")
+
+        # 3) After one event-loop tick, rebind once more.  On macOS the very
+        #    first bind right after showFullScreen() can land before the
+        #    NSView is fully realised; the redundant rebind picks up the
+        #    final winId.  Cheap, idempotent.
+        def _rebind_after_show():
             if self.fullscreen is not fs:
                 return
-            wid = int(fs.video.winId())
-            pane._external_winid = wid
             try:
+                wid2 = int(fs.video.winId())
+                pane._external_winid = wid2
                 pane._bind_player_window(pane.player)
             except Exception:
-                log.exception("fullscreen bind failed")
-        QTimer.singleShot(0, _do_bind)
+                log.exception("fullscreen rebind tick failed")
+        QTimer.singleShot(0, _rebind_after_show)
 
     def _on_fullscreen_closed(self, pane_id: int):
         if self.fullscreen is None:
