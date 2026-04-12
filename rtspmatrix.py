@@ -913,7 +913,13 @@ class MainWindow(QMainWindow):
                 media.add_option(":rtsp-tcp")
             media.add_option(":rtsp-keepalive")
             media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
-            media.add_option(f":network-caching={self.cfg.network_caching_ms}")
+            # Aggressive caching: cut the jitter buffer to get the first
+            # frame on screen faster.  100 ms is fine for a local DVR.
+            media.add_option(":network-caching=100")
+            # Ask the decoder to skip the loop filter on non-reference
+            # frames — reduces time-to-first-frame at cost of minor
+            # artefacts in the first second.
+            media.add_option(":avcodec-skiploopfilter=3")
             if self.cfg.disable_hw_decode:
                 media.add_option(":avcodec-hw=none")
 
