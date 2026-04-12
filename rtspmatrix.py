@@ -193,12 +193,6 @@ class PlayerPane(QWidget):
         self.on_focus = on_focus
         self.on_dblclick = on_dblclick
 
-        # When non-None, _bind_player_window targets this winId instead of
-        # self.frame.winId().  Used by the fullscreen feature so retries that
-        # land while we're in fullscreen create a new player bound to the
-        # fullscreen surface, not the hidden tile.
-        self._external_winid = None
-
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.frame = ClickableFrame(self)
@@ -270,11 +264,7 @@ class PlayerPane(QWidget):
             self.frame.setStyleSheet("background: black; border: 3px solid #333;")
 
     def _bind_player_window(self, player: vlc.MediaPlayer):
-        if self._external_winid is not None:
-            wid = int(self._external_winid)
-        else:
-            wid = int(self.frame.winId())
-        bind_player_to_window(player, wid)
+        bind_player_to_window(player, int(self.frame.winId()))
 
     def _detach_player_window(self):
         """Tell libVLC to stop drawing into our QFrame, but keep the player
@@ -784,8 +774,9 @@ class MainWindow(QMainWindow):
         self.grid_rows = 0
         self.grid_cols = 0
 
-        self.fullscreen = None  # active FullScreenWindow, or None
+        self.fullscreen = None          # active FullScreenWindow, or None
         self.fullscreen_pane_id = None
+        self._fs_player = None          # dedicated MediaPlayer for fullscreen
 
         self.active_pane = 1
         # Start at 0 so the first _apply_panes_visibility call treats every
@@ -878,86 +869,84 @@ class MainWindow(QMainWindow):
     # ---------- fullscreen ----------
 
     def open_fullscreen_for_pane(self, pane_id: int):
-        """Double-click handler.  Drawable-rebinds the pane's live player
-        onto a single-tile fullscreen window — no reconnect, no media reload.
-        Closing the window (any key, click, Escape) rebinds back to the tile."""
+        """Double-click handler.  Creates a SEPARATE dedicated player for the
+        fullscreen window — the tile player is never touched, so it keeps
+        playing throughout and there is no black pane on return.
+
+        The fullscreen player opens its own RTSP session (using subtype_full
+        for mainstream quality) and is disposed when the fullscreen closes.
+        The cost is ~1-2 s handshake delay on entry; the benefit is that
+        macOS drawable rebinding issues are completely sidestepped."""
         if self.fullscreen is not None:
             return
         if not (1 <= pane_id <= self.visible_panes):
             return
         pane = self.panes[pane_id - 1]
-        if pane.player is None or pane.assigned_channel is None:
-            return  # nothing to show
+        ch = pane.assigned_channel
+        if ch is None:
+            return
 
-        log.info("user: open fullscreen for pane %d (CH%d)",
-                 pane_id, pane.assigned_channel)
+        log.info("user: open fullscreen for pane %d (CH%d)", pane_id, ch)
 
-        # Top-level FullScreenWindow with no Qt parent (see class docstring).
         fs = FullScreenWindow(self.cfg.title)
         fs.closed.connect(lambda: self._on_fullscreen_closed(pane_id))
         self.fullscreen = fs
         self.fullscreen_pane_id = pane_id
 
-        # Match the virtual variant exactly: showFullScreen first, capture
-        # winId immediately (the show forces native handle allocation), then
-        # defer the actual VLC bind by one event-loop tick so the NSView /
-        # XWindow / HWND is fully realised before libVLC takes it.  No
-        # explicit detach — set_nsobject(new) is enough to switch surfaces;
-        # detaching first leaves a transient "no drawable" state that on
-        # macOS can leave the player stuck rendering nothing.
         fs.showFullScreen()
         wid_snap = int(fs.video.winId())
 
-        def _do_bind():
+        def _do_play():
             if self.fullscreen is not fs:
                 return
-            if pane.player is None:
-                return
+            # Build a dedicated player, bound to the FS surface from the start.
+            p = self.vlc.media_player_new()
+            bind_player_to_window(p, wid_snap)
+
+            url = self.cfg.url(ch, hd=True)
+            media = self.vlc.media_new(url)
+            if self.cfg.user:
+                media.add_option(f":rtsp-user={self.cfg.user}")
+            if self.cfg.password:
+                media.add_option(f":rtsp-pwd={self.cfg.password}")
+            if self.cfg.tcp:
+                media.add_option(":rtsp-tcp")
+            media.add_option(":rtsp-keepalive")
+            media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
+            media.add_option(f":network-caching={self.cfg.network_caching_ms}")
+            if self.cfg.disable_hw_decode:
+                media.add_option(":avcodec-hw=none")
+
+            p.set_media(media)
             try:
-                pane._external_winid = wid_snap
-                pane._bind_player_window(pane.player)
+                p.play()
             except Exception:
-                log.exception("fullscreen bind failed")
-        QTimer.singleShot(0, _do_bind)
+                log.exception("fullscreen play() raised")
+            self._fs_player = p
+            log.info("fullscreen: playing CH%d url=%s", ch, url)
+        QTimer.singleShot(0, _do_play)
 
     def _on_fullscreen_closed(self, pane_id: int):
         if self.fullscreen is None:
             return
         log.info("user: close fullscreen (pane %d)", pane_id)
-        pane = self.panes[pane_id - 1]
 
-        # Drop the override so any future bind targets the tile frame.  Do
-        # NOT call _detach_player_window here: detaching first leaves the
-        # player in a transient "no drawable" state from which set_nsobject
-        # to the new surface does not reliably recover on macOS.
-        pane._external_winid = None
+        # Dispose the dedicated fullscreen player.
+        if self._fs_player is not None:
+            dispose_player_async(self._fs_player)
+            self._fs_player = None
+
         self.fullscreen = None
         self.fullscreen_pane_id = None
 
         # Bring the main window back — closing the fullscreen NSWindow on
-        # macOS does not automatically restore focus to the underlying app
-        # window, so the user otherwise sees their desktop / another app.
+        # macOS does not automatically restore focus to the underlying app.
         try:
             self.showNormal()
             self.raise_()
             self.activateWindow()
         except Exception:
             log.exception("main window raise failed")
-
-        # Defer the rebind so the main window has had an event-loop tick
-        # to actually become visible / focused, and the tile's NSView is
-        # back on screen.  Re-querying winId() inside the deferred call
-        # forces fresh allocation if the handle was invalidated while the
-        # tile was hidden behind the fullscreen.
-        def _do_rebind():
-            if pane.player is None:
-                return
-            try:
-                _ = int(pane.frame.winId())
-                pane._bind_player_window(pane.player)
-            except Exception:
-                log.exception("rebind to tile failed")
-        QTimer.singleShot(0, _do_rebind)
 
         self._update_focus()
 
