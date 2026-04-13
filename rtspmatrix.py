@@ -17,7 +17,7 @@ import importlib.metadata
 
 import vlc
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
-from PyQt5.QtGui import QGuiApplication, QPixmap
+from PyQt5.QtGui import QGuiApplication, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QSizePolicy,
@@ -35,6 +35,20 @@ from rtspmatrix_common import (
     join_disposal_threads,
     bind_player_to_window,
 )
+
+# App icon — tried in order; first hit wins.  .ico works everywhere; .png
+# is the fallback for macOS/Linux where .ico support is sometimes patchy.
+_ICON_CANDIDATES = (
+    os.path.join("assets", "rtspmatrix.ico"),
+    os.path.join("assets", "rtspmatrix_icon.png"),
+)
+
+
+def _load_app_icon():
+    for p in _ICON_CANDIDATES:
+        if os.path.isfile(p):
+            return QIcon(p)
+    return None
 
 
 # ---------- config ----------
@@ -524,6 +538,9 @@ class FullScreenWindow(QMainWindow):
         # Same trick the virtual variant uses (rtspmatrix-vitual.py).
         super().__init__()
         self.setWindowTitle(title)
+        icon = _load_app_icon()
+        if icon:
+            self.setWindowIcon(icon)
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -699,6 +716,10 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(self.cfg.title)
         self.resize(1600, 1000)
+
+        self._app_icon = _load_app_icon()
+        if self._app_icon:
+            self.setWindowIcon(self._app_icon)
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -1201,6 +1222,9 @@ if __name__ == "__main__":
     log.info("RTSPMatrix starting")
 
     app = QApplication(sys.argv)
+    _icon = _load_app_icon()
+    if _icon:
+        app.setWindowIcon(_icon)
     w = MainWindow()
     app.aboutToQuit.connect(w.cleanup)
     _tick = install_sigint_handler(w)
