@@ -353,7 +353,7 @@ class PlayerPane(QWidget):
         if self.retry_timer.isActive():
             self.retry_timer.stop()
 
-    def stop_to_idle(self):
+    def stop_to_idle(self, keep_channel=False):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
@@ -362,12 +362,16 @@ class PlayerPane(QWidget):
         if self.player is not None:
             dispose_player_async(self.player)
         self.player = self._new_player()
-        self.assigned_channel = None
         self._retry_attempt = 0
         self._opening_since_ts = 0.0
         self._last_progress_ts = 0.0
         self._is_playing = False
-        self.label.setText(f"Pane {self.pane_id}: Idle")
+        if keep_channel and self.assigned_channel is not None:
+            self.label.setText(
+                f"Pane {self.pane_id}: {self.cfg.channel_text(self.assigned_channel)} (hidden)")
+        else:
+            self.assigned_channel = None
+            self.label.setText(f"Pane {self.pane_id}: Idle")
 
     def play_channel(self, ch: int):
         ch = int(max(1, min(16, ch)))
@@ -1067,9 +1071,10 @@ class MainWindow(QMainWindow):
         # slate.
         self._close_fullscreen_if_any()
 
-        # Stop streams that just disappeared (saves bandwidth + decode CPU).
+        # Stop streams that just disappeared (saves bandwidth + decode CPU)
+        # but keep assigned_channel so switching back restores them.
         for i in range(n, prev):
-            self.panes[i].stop_to_idle()
+            self.panes[i].stop_to_idle(keep_channel=True)
 
         self._rebuild_grid()
 
