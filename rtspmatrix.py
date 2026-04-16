@@ -35,6 +35,7 @@ from rtspmatrix_common import (
     dispose_player_async,
     join_disposal_threads,
     bind_player_to_window,
+    profiler,
 )
 
 # App icon — tried in order; first hit wins.  .ico works everywhere; .png
@@ -105,6 +106,13 @@ class RtspConfig:
         # batch (pane-count increase / view apply).  Set to 0 to open all
         # at once.  200 ms smooths out the DVR+network load burst.
         self.stagger_open_ms = int(a.get("stagger_open_ms", 200))
+        # Enable the internal profiler (named timers / counters / gauges
+        # dumped to the log every profile_dump_interval_s seconds).  Zero
+        # overhead when disabled.
+        self.profile = a.get("profile", "false").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        self.profile_dump_interval_s = int(a.get("profile_dump_interval_s", 10))
 
         raw_labels = cp["view"].get("labels", "") if cp.has_section("view") else ""
         self.labels = parse_labels(raw_labels)
@@ -266,6 +274,9 @@ class PlayerPane(QWidget):
         self._last_progress_ts = 0.0
         self._is_playing = False
         self._player_gen = 0
+        # Timestamp of the most recent _start_play; cleared on first
+        # "playing" event so the profiler records time-to-first-frame.
+        self._play_started_ts = 0.0
 
         # The watchdog only checks "are we still making forward progress" —
         # it does not poll get_state().  All state transitions come from
@@ -399,6 +410,7 @@ class PlayerPane(QWidget):
         self.player = self._new_player()
         if old is not None:
             dispose_player_async(old)
+            profiler.count("player_swap")
         return self.player
 
     def _cancel_retry(self):
@@ -454,45 +466,55 @@ class PlayerPane(QWidget):
             self.watchdog_timer.start()
 
     def _start_play(self, ch: int, reason: str):
-        p = self._swap_player()
+        with profiler.time("start_play"):
+            p = self._swap_player()
 
-        url = self.cfg.url(ch)
-        media = self.vlc.media_new(url)
+            url = self.cfg.url(ch)
+            media = self.vlc.media_new(url)
 
-        if self.cfg.user:
-            media.add_option(f":rtsp-user={self.cfg.user}")
-        if self.cfg.password:
-            media.add_option(f":rtsp-pwd={self.cfg.password}")
+            if self.cfg.user:
+                media.add_option(f":rtsp-user={self.cfg.user}")
+            if self.cfg.password:
+                media.add_option(f":rtsp-pwd={self.cfg.password}")
 
-        # harden RTSP
-        if self.cfg.tcp:
-            media.add_option(":rtsp-tcp")
-        media.add_option(":rtsp-keepalive")
-        media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
+            # harden RTSP
+            if self.cfg.tcp:
+                media.add_option(":rtsp-tcp")
+            media.add_option(":rtsp-keepalive")
+            media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
 
-        # jitter buffer
-        media.add_option(f":network-caching={self.cfg.network_caching_ms}")
+            # jitter buffer
+            media.add_option(f":network-caching={self.cfg.network_caching_ms}")
 
-        # macOS HW decode deadlock mitigation
-        if self.cfg.disable_hw_decode:
-            media.add_option(":avcodec-hw=none")
+            # macOS HW decode deadlock mitigation
+            if self.cfg.disable_hw_decode:
+                media.add_option(":avcodec-hw=none")
 
-        p.set_media(media)
-        try:
-            p.play()
-        except Exception:
-            log.exception("pane %d: MediaPlayer.play() raised", self.pane_id)
+            p.set_media(media)
+            try:
+                p.play()
+            except Exception:
+                log.exception("pane %d: MediaPlayer.play() raised", self.pane_id)
 
-        log.info("pane %d: opening CH%d (%s) url=%s",
-                 self.pane_id, ch, reason, url)
-        self.label.setText(f"Pane {self.pane_id}: Opening {self.cfg.channel_text(ch)} ({reason})")
-        self.open_timer.start(self.cfg.open_timeout_ms)
+            # Stash the start timestamp so the "playing" event handler can
+            # record time-to-first-frame.
+            self._play_started_ts = time.perf_counter()
+            profiler.count("start_play.calls")
+            if reason.startswith("retry"):
+                profiler.count("start_play.retries")
+
+            log.info("pane %d: opening CH%d (%s) url=%s",
+                     self.pane_id, ch, reason, url)
+            self.label.setText(f"Pane {self.pane_id}: Opening {self.cfg.channel_text(ch)} ({reason})")
+            self.open_timer.start(self.cfg.open_timeout_ms)
 
     def _schedule_retry(self, why: str):
         if self._retry_pending or self.assigned_channel is None:
             return
         self._retry_pending = True
         self._retry_attempt += 1
+        profiler.count("retry_scheduled")
+        profiler.count(f"retry_reason.{why.split('(')[0].strip()}")
 
         delay = min(self.cfg.retry_max_ms, self.cfg.retry_base_ms * (2 ** max(0, self._retry_attempt - 1)))
         ch = self.assigned_channel
@@ -512,6 +534,7 @@ class PlayerPane(QWidget):
     def _on_state_event(self, name: str, gen: int):
         """Slot — runs on the GUI thread.  libVLC event callbacks emit
         state_event from libVLC threads; queued connection delivers it here."""
+        profiler.count(f"state_event.{name}")
         # Stale event from a swapped-out / disposed player — ignore.
         if gen != self._player_gen or self.assigned_channel is None:
             return
@@ -520,6 +543,11 @@ class PlayerPane(QWidget):
         now = time.monotonic()
 
         if name == "playing":
+            # Time-to-first-frame: elapsed from _start_play to "playing".
+            if self._play_started_ts > 0:
+                ttff_ms = (time.perf_counter() - self._play_started_ts) * 1000.0
+                profiler.record("time_to_first_frame_ms", ttff_ms)
+                self._play_started_ts = 0.0
             self._is_playing = True
             self._last_progress_ts = now
             self._opening_since_ts = 0.0
@@ -590,6 +618,10 @@ class PlayerPane(QWidget):
         Bitrate + lost frames come from MediaStats.  If the counter is
         broken on this libVLC build, the overlay still shows FPS and a
         placeholder for bitrate."""
+        with profiler.time("update_stats_pane"):
+            self._update_stats_impl()
+
+    def _update_stats_impl(self):
         if self.player is None or self.assigned_channel is None:
             self.fps_label.hide()
             self._last_bitrate_bps = 0.0
@@ -909,6 +941,23 @@ class MainWindow(QMainWindow):
         self._agg_stats_timer.timeout.connect(self._update_aggregate_stats)
         self._agg_stats_timer.start()
 
+        # Profiler plumbing: a periodic dump timer + a tight event-loop
+        # tick that measures scheduling jitter (if the jitter spikes,
+        # something is blocking the GUI thread).  Both short-circuit on
+        # profiler.enabled is False, so zero overhead otherwise.
+        if profiler.enabled:
+            self._profile_dump_timer = QTimer(self)
+            self._profile_dump_timer.setInterval(
+                self.cfg.profile_dump_interval_s * 1000)
+            self._profile_dump_timer.timeout.connect(self._profile_dump_tick)
+            self._profile_dump_timer.start()
+
+            self._profile_jitter_last = time.perf_counter()
+            self._profile_jitter_timer = QTimer(self)
+            self._profile_jitter_timer.setInterval(100)  # 10 Hz scheduling probe
+            self._profile_jitter_timer.timeout.connect(self._profile_jitter_tick)
+            self._profile_jitter_timer.start()
+
         self.panes_grid = QGridLayout()
         self.panes_grid.setSpacing(8)
         main.addLayout(self.panes_grid, 1)
@@ -1035,6 +1084,32 @@ class MainWindow(QMainWindow):
         if total_lost > 0:
             pieces.append(f"lost: {total_lost}")
         self.info.setText("  |  ".join(pieces))
+
+        # Feed gauges to the profiler (cheap no-op when disabled).
+        profiler.gauge("visible_panes", len(visible))
+        profiler.gauge("playing_panes", playing)
+        profiler.gauge("total_bps", int(total_bps))
+        profiler.gauge("total_lost_per_sec", total_lost)
+
+    def _profile_dump_tick(self):
+        # Sample per-pane state as gauges right before we dump, so the
+        # summary shows the current live values.
+        alive_players = sum(1 for p in self.panes if p.player is not None)
+        profiler.gauge("alive_players", alive_players)
+        profiler.gauge("fullscreen_active", int(self._fullscreen_active))
+        profiler.gauge("active_pane", self.active_pane)
+        profiler.dump()
+
+    def _profile_jitter_tick(self):
+        now = time.perf_counter()
+        expected_dt = self._profile_jitter_timer.interval() / 1000.0
+        actual_dt = now - self._profile_jitter_last
+        jitter_ms = (actual_dt - expected_dt) * 1000.0
+        # Only record positive jitter (late fires); early fires are a Qt
+        # scheduling artefact not caused by blocking.
+        if jitter_ms > 0:
+            profiler.record("gui_loop_jitter_ms", jitter_ms)
+        self._profile_jitter_last = now
 
     def set_active_pane(self, pane_id: int):
         # In fullscreen, a click on the sole visible tile is "exit",
@@ -1193,6 +1268,10 @@ class MainWindow(QMainWindow):
           3. force Qt to allocate a fresh native window handle,
           4. rebind the player to that handle.
         Players keep playing throughout — no reconnect, no media reload."""
+        with profiler.time("rebuild_grid"):
+            self._rebuild_grid_impl()
+
+    def _rebuild_grid_impl(self):
         n = self.visible_panes
 
         # Detach EVERY pane that has a player, not just the soon-to-be-visible
@@ -1232,6 +1311,10 @@ class MainWindow(QMainWindow):
             self.panes[i].rebind_to_current_frame()
 
     def _apply_panes_visibility(self, n: int):
+        with profiler.time("apply_panes_visibility"):
+            self._apply_panes_visibility_impl(n)
+
+    def _apply_panes_visibility_impl(self, n: int):
         n = max(1, min(16, int(n)))
         prev = self.visible_panes
         self.visible_panes = n
@@ -1446,6 +1529,8 @@ if __name__ == "__main__":
     try:
         _early_cfg = RtspConfig("rtsp.ini")
         setup_logging(_early_cfg.log_level, _early_cfg.log_file)
+        if _early_cfg.profile:
+            profiler.enable()
     except Exception:
         setup_logging("INFO", "")
         log.exception("Failed to read rtsp.ini for early logging setup")

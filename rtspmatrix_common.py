@@ -5,6 +5,7 @@
 # stdlib + python-vlc + (optionally) PyQt5 are fine, but no project-local
 # imports — both viewers must be able to import it cheaply.
 
+import contextlib
 import json
 import logging
 import os
@@ -176,3 +177,109 @@ def setup_logging(level_name: str = "INFO", log_file: str = ""):
                 log.addHandler(fh)
             except Exception as exc:
                 log.warning("Could not open log file %s: %s", log_file, exc)
+
+
+# ---------- profiling ----------
+
+class Profiler:
+    """Lightweight in-process profiler.
+
+    Three kinds of metric:
+      - timers    : wall-clock durations accumulated via a context manager,
+                    summarised as n / total / mean / p99 / max per window
+      - counters  : monotonically-increasing event counts per window
+      - gauges    : instantaneous values (e.g. "alive players: 14")
+
+    Zero overhead when disabled: every public method short-circuits on
+    `self.enabled is False`.  Call enable() at startup if [app] profile
+    is set in rtsp.ini.  Dump via dump() (cheap) — usually wired to a 10 s
+    QTimer in the main window.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self._lock = threading.Lock()
+        self._timers = {}    # name -> list[float ms]
+        self._counters = {}  # name -> int
+        self._gauges = {}    # name -> Any
+
+    def enable(self):
+        self.enabled = True
+        log.info("profiler enabled")
+
+    def disable(self):
+        self.enabled = False
+
+    @contextlib.contextmanager
+    def time(self, name):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            with self._lock:
+                self._timers.setdefault(name, []).append(dt_ms)
+
+    def record(self, name, dt_ms):
+        """Manually record a timing sample (for cross-thread measurements
+        that don't fit the context-manager shape)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._timers.setdefault(name, []).append(float(dt_ms))
+
+    def count(self, name, n=1):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._counters[name] = self._counters.get(name, 0) + n
+
+    def gauge(self, name, value):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._gauges[name] = value
+
+    def dump(self):
+        """Log a summary of the last window and reset timers + counters.
+        Gauges persist (they represent current state, not deltas)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            timers = self._timers
+            counters = self._counters
+            gauges = dict(self._gauges)
+            self._timers = {}
+            self._counters = {}
+
+        if not (timers or counters or gauges):
+            return
+
+        lines = ["=== profile ==="]
+        for name in sorted(timers):
+            samples = timers[name]
+            n = len(samples)
+            if n == 0:
+                continue
+            total = sum(samples)
+            mean = total / n
+            mx = max(samples)
+            mn = min(samples)
+            p99 = sorted(samples)[int(n * 0.99)] if n > 1 else samples[0]
+            lines.append(
+                "  timer %-28s  n=%-5d  total=%7.1f ms  "
+                "mean=%6.2f  min=%5.2f  p99=%6.2f  max=%6.2f"
+                % (name, n, total, mean, mn, p99, mx)
+            )
+        for name in sorted(counters):
+            lines.append("  count %-28s  %d" % (name, counters[name]))
+        for name in sorted(gauges):
+            lines.append("  gauge %-28s  %s" % (name, gauges[name]))
+        log.info("\n".join(lines))
+
+
+# Module-level singleton.  All callers share the same instance.
+profiler = Profiler()
