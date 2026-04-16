@@ -530,57 +530,6 @@ class PlayerPane(QWidget):
             self.player = None
 
 
-class FullScreenWindow(QMainWindow):
-    """Single-tile fullscreen viewer.
-
-    Holds a single QFrame with WA_NativeWindow set, so its winId() is a
-    real OS-level handle that libVLC can render into.  Closes on any key
-    press (per user spec) or on a left mouse click.
-    """
-    closed = pyqtSignal()
-
-    def __init__(self, title: str):
-        # IMPORTANT: do NOT pass a Qt parent here.  Passing the MainWindow as
-        # parent turns this into a Cocoa child window on macOS, which never
-        # gets its own NSWindow and therefore won't render any libVLC frames.
-        # Same trick the virtual variant uses (rtspmatrix-vitual.py).
-        super().__init__()
-        self.setWindowTitle(title)
-        icon = _load_app_icon()
-        if icon:
-            self.setWindowIcon(icon)
-
-        root = QWidget(self)
-        self.setCentralWidget(root)
-        v = QVBoxLayout(root)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
-
-        self.video = ClickableFrame(self)
-        self.video.setStyleSheet("background: black;")
-        self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # WA_NativeWindow gives this child widget its own OS-level window
-        # handle so libVLC binds to the video area specifically, not to the
-        # whole QMainWindow.
-        self.video.setAttribute(Qt.WA_NativeWindow, True)
-        # Defer the close so the mousePressEvent stack can fully unwind
-        # before Qt starts tearing down the video widget.  Otherwise the
-        # super().mousePressEvent in ClickableFrame would land on a freed
-        # C++ object.
-        self.video.clicked.connect(lambda: QTimer.singleShot(0, self.close))
-        v.addWidget(self.video, 1)
-
-    def keyPressEvent(self, event):
-        # Per spec: any key exits.  Even pure modifier presses count.
-        # Defer for the same reason the click handler does.
-        event.accept()
-        QTimer.singleShot(0, self.close)
-
-    def closeEvent(self, event):
-        self.closed.emit()
-        super().closeEvent(event)
-
-
 ABOUT_LOGO_CANDIDATES = (
     "RTSPMatrix_logo.png",
     os.path.join("assets", "RTSPMatrix_logo.png"),
@@ -737,12 +686,16 @@ class MainWindow(QMainWindow):
 
         self.btn_channels = QButtonGroup(self)
         self.btn_channels.setExclusive(False)
-        grid_btn = QGridLayout()
+        # Wrap the channel-buttons grid in a QWidget so fullscreen mode can
+        # hide the whole strip with a single setVisible(False).
+        self._btn_panel = QWidget(self)
+        grid_btn = QGridLayout(self._btn_panel)
+        grid_btn.setContentsMargins(0, 0, 0, 0)
         grid_btn.setSpacing(6)
         for i, ch in enumerate(range(1, 17)):
             lbl = self.cfg.label_for(ch)
             text = f"{ch}\n{lbl}" if lbl else str(ch)
-            b = QPushButton(text, self)
+            b = QPushButton(text, self._btn_panel)
             b.setMinimumHeight(46)
             b.setMinimumWidth(110)
             if not self.cfg.is_channel_active(ch):
@@ -752,9 +705,12 @@ class MainWindow(QMainWindow):
             grid_btn.addWidget(b, i // 8, i % 8)
         for c in range(8):
             grid_btn.setColumnStretch(c, 1)
-        main.addLayout(grid_btn)
+        main.addWidget(self._btn_panel)
 
-        controls = QHBoxLayout()
+        # Controls container (same reason).
+        self._controls_panel = QWidget(self)
+        controls = QHBoxLayout(self._controls_panel)
+        controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(10)
 
         controls.addWidget(QLabel("Streams:", self))
@@ -786,7 +742,7 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
         controls.addWidget(self.btn_about)
 
-        main.addLayout(controls)
+        main.addWidget(self._controls_panel)
 
         self.info = QLabel("Active pane: 1", self)
         self.info.setStyleSheet("color: #ddd;")
@@ -803,9 +759,17 @@ class MainWindow(QMainWindow):
         self.grid_rows = 0
         self.grid_cols = 0
 
-        self.fullscreen = None          # active FullScreenWindow, or None
-        self.fullscreen_pane_id = None
-        self._fs_player = None          # dedicated MediaPlayer for fullscreen
+        # Fullscreen is done in-place: the main window goes fullscreen, the
+        # toolbar/controls hide, every other pane hides, and row/col
+        # stretches are rebalanced so the chosen pane's cell takes all
+        # available space.  No reparenting, no winId churn, no second RTSP
+        # session — the pane's live player just gets a bigger surface and
+        # libVLC scales the video to fit (aspect ratio preserved by default).
+        self._fullscreen_active = False
+        self._fs_pane_id = None
+        self._fs_saved_row_stretches = []
+        self._fs_saved_col_stretches = []
+        self._fs_was_maximized = False
 
         self.active_pane = 1
         # Start at 0 so the first _apply_panes_visibility call treats every
@@ -887,6 +851,11 @@ class MainWindow(QMainWindow):
         self.info.setText(f"Active pane: {self.active_pane}")
 
     def set_active_pane(self, pane_id: int):
+        # In fullscreen, a click on the sole visible tile is "exit",
+        # matching the any-key-exits convention.
+        if self._fullscreen_active:
+            QTimer.singleShot(0, self._exit_fullscreen)
+            return
         if pane_id > self.visible_panes:
             pane_id = 1
         if self.active_pane == pane_id:
@@ -898,100 +867,111 @@ class MainWindow(QMainWindow):
     # ---------- fullscreen ----------
 
     def open_fullscreen_for_pane(self, pane_id: int):
-        """Double-click handler.  Creates a SEPARATE dedicated player for the
-        fullscreen window — the tile player is never touched, so it keeps
-        playing throughout and there is no black pane on return.
+        """Double-click handler.  Makes the ALREADY-PLAYING tile take over
+        the whole screen: main window goes fullscreen, toolbar/controls hide,
+        every other pane hides, and row/col stretches are adjusted so the
+        chosen pane's cell gets all the space.
 
-        The fullscreen player opens its own RTSP session (using subtype_full
-        for mainstream quality) and is disposed when the fullscreen closes.
-        The cost is ~1-2 s handshake delay on entry; the benefit is that
-        macOS drawable rebinding issues are completely sidestepped."""
-        if self.fullscreen is not None:
+        The pane's live MediaPlayer is never touched — libVLC resizes its
+        video output to fit the new frame size, preserving aspect ratio.
+        No RTSP reconnect, no winId change, no black flicker."""
+        if self._fullscreen_active:
             return
         if not (1 <= pane_id <= self.visible_panes):
             return
         pane = self.panes[pane_id - 1]
-        ch = pane.assigned_channel
-        if ch is None:
+        if pane.assigned_channel is None:
             return
 
-        log.info("user: open fullscreen for pane %d (CH%d)", pane_id, ch)
+        log.info("user: fullscreen pane %d (CH%d)", pane_id, pane.assigned_channel)
 
-        fs = FullScreenWindow(self.cfg.title)
-        fs.closed.connect(lambda: self._on_fullscreen_closed(pane_id))
-        self.fullscreen = fs
-        self.fullscreen_pane_id = pane_id
+        # Where is the target pane in the current grid?  _rebuild_grid puts
+        # pane i at (i // cols, i % cols).
+        target_idx = pane_id - 1
+        cols = max(1, self.grid_cols)
+        target_r = target_idx // cols
+        target_c = target_idx % cols
 
-        fs.showFullScreen()
-        wid_snap = int(fs.video.winId())
+        # Snapshot the stretches we'll restore on exit.
+        self._fs_saved_row_stretches = [
+            self.panes_grid.rowStretch(r) for r in range(max(1, self.grid_rows))
+        ]
+        self._fs_saved_col_stretches = [
+            self.panes_grid.columnStretch(c) for c in range(cols)
+        ]
+        self._fs_was_maximized = self.isMaximized()
+        self._fs_pane_id = pane_id
+        self._fullscreen_active = True
 
-        def _do_play():
-            if self.fullscreen is not fs:
-                return
-            # Build a dedicated player, bound to the FS surface from the start.
-            p = self.vlc.media_player_new()
-            bind_player_to_window(p, wid_snap)
+        # Hide every other visible pane.  Hidden widgets in a QGridLayout
+        # do not consume space by default, so the remaining cell expands.
+        for i in range(self.visible_panes):
+            if i != target_idx:
+                self.panes[i].setVisible(False)
 
-            url = self.cfg.url(ch, hd=True)
-            media = self.vlc.media_new(url)
-            if self.cfg.user:
-                media.add_option(f":rtsp-user={self.cfg.user}")
-            if self.cfg.password:
-                media.add_option(f":rtsp-pwd={self.cfg.password}")
-            if self.cfg.tcp:
-                media.add_option(":rtsp-tcp")
-            media.add_option(":rtsp-keepalive")
-            media.add_option(f":rtsp-timeout={self.cfg.rtsp_timeout_s}")
-            # Aggressive caching: cut the jitter buffer to get the first
-            # frame on screen faster.  100 ms is fine for a local DVR.
-            media.add_option(":network-caching=100")
-            # Ask the decoder to skip the loop filter on non-reference
-            # frames — reduces time-to-first-frame at cost of minor
-            # artefacts in the first second.
-            media.add_option(":avcodec-skiploopfilter=3")
-            if self.cfg.disable_hw_decode:
-                media.add_option(":avcodec-hw=none")
+        # Hide toolbar / controls / info.
+        self._btn_panel.setVisible(False)
+        self._controls_panel.setVisible(False)
+        self.info.setVisible(False)
 
-            p.set_media(media)
-            try:
-                p.play()
-            except Exception:
-                log.exception("fullscreen play() raised")
-            self._fs_player = p
-            log.info("fullscreen: playing CH%d url=%s", ch, url)
-        QTimer.singleShot(0, _do_play)
+        # Drive all the stretch onto the target cell so the remaining pane
+        # fills the entire grid area.
+        for r in range(max(1, self.grid_rows)):
+            self.panes_grid.setRowStretch(r, 1 if r == target_r else 0)
+        for c in range(cols):
+            self.panes_grid.setColumnStretch(c, 1 if c == target_c else 0)
 
-    def _on_fullscreen_closed(self, pane_id: int):
-        if self.fullscreen is None:
+        self.showFullScreen()
+        # Main window needs focus so keyPressEvent is delivered here, not
+        # to a pushbutton or combobox that still has it.
+        self.setFocus()
+
+    def _exit_fullscreen(self):
+        if not self._fullscreen_active:
             return
-        log.info("user: close fullscreen (pane %d)", pane_id)
+        log.info("user: exit fullscreen (pane %d)", self._fs_pane_id)
+        self._fullscreen_active = False
+        self._fs_pane_id = None
 
-        # Dispose the dedicated fullscreen player.
-        if self._fs_player is not None:
-            dispose_player_async(self._fs_player)
-            self._fs_player = None
+        # Restore toolbar / controls / info.
+        self._btn_panel.setVisible(True)
+        self._controls_panel.setVisible(True)
+        self.info.setVisible(True)
 
-        self.fullscreen = None
-        self.fullscreen_pane_id = None
+        # Re-show every pane that's part of the current layout.
+        for i in range(self.visible_panes):
+            self.panes[i].setVisible(True)
 
-        # Bring the main window back — closing the fullscreen NSWindow on
-        # macOS does not automatically restore focus to the underlying app.
-        try:
+        # Restore stretches.
+        cols = max(1, self.grid_cols)
+        rows = max(1, self.grid_rows)
+        for r in range(rows):
+            v = self._fs_saved_row_stretches[r] if r < len(self._fs_saved_row_stretches) else 1
+            self.panes_grid.setRowStretch(r, v)
+        for c in range(cols):
+            v = self._fs_saved_col_stretches[c] if c < len(self._fs_saved_col_stretches) else 1
+            self.panes_grid.setColumnStretch(c, v)
+
+        # Exit fullscreen.  showNormal or showMaximized depending on prior
+        # state so the user doesn't lose their maximized window.
+        if self._fs_was_maximized:
+            self.showMaximized()
+        else:
             self.showNormal()
-            self.raise_()
-            self.activateWindow()
-        except Exception:
-            log.exception("main window raise failed")
-
-        self._update_focus()
+        self.raise_()
+        self.activateWindow()
 
     def _close_fullscreen_if_any(self):
-        if self.fullscreen is None:
+        if self._fullscreen_active:
+            self._exit_fullscreen()
+
+    def keyPressEvent(self, event):
+        # Any key exits fullscreen per user spec.
+        if self._fullscreen_active:
+            event.accept()
+            QTimer.singleShot(0, self._exit_fullscreen)
             return
-        try:
-            self.fullscreen.close()
-        except Exception:
-            log.exception("fullscreen close failed")
+        super().keyPressEvent(event)
 
     def _grid_dims(self, n: int):
         """Pick (rows, cols) for n tiles, honouring self.split_orientation.
