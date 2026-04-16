@@ -10,6 +10,7 @@ import sys
 import os
 import math
 import signal
+import logging
 import platform
 import time
 import configparser
@@ -286,9 +287,12 @@ class PlayerPane(QWidget):
         # the libVLC-thread -> GUI-thread handoff safe.
         self.state_event.connect(self._on_state_event)
 
-        # Per-pane stats: FPS + bitrate + lost frames, sampled from
-        # libVLC's MediaStats once per second.  MainWindow reads
-        # _last_* attributes to build the aggregate status line.
+        # Per-pane stats: FPS + bitrate + lost frames.  FPS is counted from
+        # libVLC "time" events (one per displayed frame PTS update) which
+        # is far more reliable than MediaStats.decoded_video on RTSP
+        # streams.  Bitrate comes from MediaStats.input_bitrate.
+        self._time_event_count = 0
+        self._last_time_event_count = 0
         self._last_decoded_video = 0
         self._last_read_bytes = 0
         self._last_lost_pictures = 0
@@ -375,6 +379,8 @@ class PlayerPane(QWidget):
         self._player_gen += 1
         self._wire_player_events(p, self._player_gen)
         # New player -> fresh stats counters, so deltas don't go negative.
+        self._time_event_count = 0
+        self._last_time_event_count = 0
         self._last_decoded_video = 0
         self._last_read_bytes = 0
         self._last_lost_pictures = 0
@@ -526,6 +532,7 @@ class PlayerPane(QWidget):
         if name == "time":
             # Forward-progress heartbeat — fires whenever the player advances.
             self._last_progress_ts = now
+            self._time_event_count += 1
             # Time events implicitly mean the player is playing.  Treat as
             # a safety net in case a transient paused/stopped event
             # cleared the flag and no explicit "playing" followed.
@@ -576,17 +583,13 @@ class PlayerPane(QWidget):
         return f"{int(bps)} bps"
 
     def _update_stats(self):
-        """Once-per-second sample of libVLC's MediaStats.  Updates the
-        green overlay in the top-left of the video frame with fps and
-        bitrate, and caches the values on self so MainWindow can build
-        an aggregate across all panes.
+        """Once-per-second sample.
 
-        Uses VLC's precomputed input_bitrate (float) as the primary
-        bitrate source — read_bytes is a c_int and overflows within
-        minutes at typical DVR bitrates, producing a bogus 0 after the
-        wrap.  decoded_video is treated as a free-running counter:
-        negative deltas are treated as counter resets and dropped, not
-        clamped to 0 for the rest of the session."""
+        FPS comes from counting libVLC "time" events — fires on every PTS
+        update (~1 per displayed frame) and is reliable on all builds.
+        Bitrate + lost frames come from MediaStats.  If the counter is
+        broken on this libVLC build, the overlay still shows FPS and a
+        placeholder for bitrate."""
         if self.player is None or self.assigned_channel is None:
             self.fps_label.hide()
             self._last_bitrate_bps = 0.0
@@ -594,76 +597,79 @@ class PlayerPane(QWidget):
             self._last_lost = 0
             return
 
-        media = self.player.get_media()
-        if media is None:
-            return
-
-        # Fresh struct every call: some python-vlc builds have returned
-        # stale data when the same MediaStats instance is reused.
-        stats = vlc.MediaStats()
-        try:
-            ok = media.get_stats(stats)
-        except Exception:
-            ok = False
-        if not ok:
-            return
-
         now = time.monotonic()
-        decoded = int(stats.decoded_video)
-        rbytes  = int(stats.read_bytes)
-        lost    = int(stats.lost_pictures)
+        tec = self._time_event_count
 
-        # VLC's precomputed input bitrate.  Units vary by build (roughly
-        # bytes / microsecond), so we calibrate: scale * rate should give
-        # bits per second.  8e6 matches current libVLC (bytes/μs -> bits/s).
-        bps_from_vlc = float(stats.input_bitrate) * 8_000_000.0
-
+        # FPS from time events — one per displayed frame PTS update.
         fps = self._last_fps
-        bps = self._last_bitrate_bps
-        dl  = 0
-
         if self._last_stats_ts > 0.0:
             dt = now - self._last_stats_ts
             if dt > 0:
-                dv_raw = decoded - self._last_decoded_video
-                dv = dv_raw if 0 <= dv_raw < 1_000_000 else 0
-                fps = dv / dt
+                dtec = max(0, tec - self._last_time_event_count)
+                fps = dtec / dt
 
-                dl_raw = lost - self._last_lost_pictures
-                dl = dl_raw if 0 <= dl_raw < 1_000_000 else 0
+        # Bitrate + lost from MediaStats (best-effort).
+        bps = self._last_bitrate_bps
+        dl = 0
 
-                # Primary: VLC's own bitrate, if non-zero.
-                if bps_from_vlc > 0:
-                    bps = bps_from_vlc
-                else:
-                    # Fallback: read_bytes delta, guarded against the
-                    # int32 wrap.
-                    db_raw = rbytes - self._last_read_bytes
-                    if 0 <= db_raw < (1 << 30):
-                        bps = db_raw * 8.0 / dt
-                    # else leave bps at previous value (wrap detected)
+        media = self.player.get_media()
+        if media is not None:
+            stats = vlc.MediaStats()
+            try:
+                ok = media.get_stats(stats)
+            except Exception:
+                ok = False
+            if ok:
+                rbytes = int(stats.read_bytes)
+                lost   = int(stats.lost_pictures)
+                bps_from_vlc = float(stats.input_bitrate) * 8_000_000.0
+
+                if self._last_stats_ts > 0.0:
+                    dt = now - self._last_stats_ts
+                    if dt > 0:
+                        dl_raw = lost - self._last_lost_pictures
+                        dl = dl_raw if 0 <= dl_raw < 1_000_000 else 0
+
+                        if bps_from_vlc > 0:
+                            bps = bps_from_vlc
+                        else:
+                            db_raw = rbytes - self._last_read_bytes
+                            if 0 <= db_raw < (1 << 30):
+                                bps = db_raw * 8.0 / dt
+                            # else leave bps at previous value (wrap)
+
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "pane %d stats: decoded=%d read_bytes=%d lost=%d "
+                        "input_bitrate=%.6f -> fps(evt)=%.1f bps=%.0f",
+                        self.pane_id, int(stats.decoded_video), rbytes, lost,
+                        float(stats.input_bitrate), fps, bps,
+                    )
+
+                self._last_read_bytes = rbytes
+                self._last_lost_pictures = lost
+                self._last_decoded_video = int(stats.decoded_video)
 
         self._last_fps = fps
         self._last_bitrate_bps = bps
         self._last_lost = dl
-        self._last_decoded_video = decoded
-        self._last_read_bytes = rbytes
-        self._last_lost_pictures = lost
+        self._last_time_event_count = tec
         self._last_stats_ts = now
 
-        # Only render once we actually have something to show.  Once we
-        # have data, keep the overlay visible — don't flash it in and out
-        # on momentary state transitions.
-        if fps > 0 or bps > 0:
-            if dl > 0:
-                text = f"{fps:>4.0f} fps\n{self._format_rate(bps)}\nlost {dl}"
-            else:
-                text = f"{fps:>4.0f} fps\n{self._format_rate(bps)}"
-            self.fps_label.setText(text)
-            self.fps_label.adjustSize()
-            if not self.fps_label.isVisible():
-                self.fps_label.show()
-                self.fps_label.raise_()
+        # Always render once we have a playing player + assigned channel.
+        # Show dashes for values that are still zero so the user can see
+        # the overlay came up, and which field is missing.
+        fps_txt = f"{fps:>4.0f} fps" if fps > 0 else "  -- fps"
+        bps_txt = self._format_rate(bps) if bps > 0 else " -- bps"
+        if dl > 0:
+            text = f"{fps_txt}\n{bps_txt}\nlost {dl}"
+        else:
+            text = f"{fps_txt}\n{bps_txt}"
+        self.fps_label.setText(text)
+        self.fps_label.adjustSize()
+        if not self.fps_label.isVisible():
+            self.fps_label.show()
+            self.fps_label.raise_()
 
     def shutdown(self):
         self._cancel_retry()
