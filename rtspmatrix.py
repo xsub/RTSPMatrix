@@ -225,6 +225,26 @@ class PlayerPane(QWidget):
         self.frame.clicked.connect(self._clicked)
         self.frame.doubleClicked.connect(self._dblclicked)
 
+        # Stats overlay in top-left of the video frame.  WA_NativeWindow so
+        # it gets its own NSView / X window and stacks above the libVLC
+        # render surface on macOS (a plain QLabel child would be obscured
+        # by the Metal/CoreGraphics output).
+        self.fps_label = QLabel("", self.frame)
+        self.fps_label.setAttribute(Qt.WA_NativeWindow, True)
+        self.fps_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.fps_label.setStyleSheet(
+            "QLabel {"
+            " color: #00ff00;"
+            " font-family: 'Courier New', 'Courier', 'Menlo', monospace;"
+            " font-size: 12px;"
+            " font-weight: bold;"
+            " background: rgba(0, 0, 0, 150);"
+            " padding: 2px 4px;"
+            "}"
+        )
+        self.fps_label.move(5, 5)
+        self.fps_label.hide()
+
         self.label = QLabel(f"Pane {pane_id}: Idle", self)
         self.label.setStyleSheet("color: #ddd;")
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -265,6 +285,22 @@ class PlayerPane(QWidget):
         # Queued connection (default for cross-thread emit) is what makes
         # the libVLC-thread -> GUI-thread handoff safe.
         self.state_event.connect(self._on_state_event)
+
+        # Per-pane stats: FPS + bitrate + lost frames, sampled from
+        # libVLC's MediaStats once per second.  MainWindow reads
+        # _last_* attributes to build the aggregate status line.
+        self._stats_struct = vlc.MediaStats()
+        self._last_decoded_video = 0
+        self._last_read_bytes = 0
+        self._last_lost_pictures = 0
+        self._last_stats_ts = 0.0
+        self._last_bitrate_bps = 0.0
+        self._last_fps = 0.0
+        self._last_lost = 0
+        self.stats_timer = QTimer(self)
+        self.stats_timer.setInterval(1000)
+        self.stats_timer.timeout.connect(self._update_stats)
+        self.stats_timer.start()
 
         QTimer.singleShot(0, self._ensure_player)
 
@@ -339,6 +375,14 @@ class PlayerPane(QWidget):
         self._bind_player_window(p)
         self._player_gen += 1
         self._wire_player_events(p, self._player_gen)
+        # New player -> fresh stats counters, so deltas don't go negative.
+        self._last_decoded_video = 0
+        self._last_read_bytes = 0
+        self._last_lost_pictures = 0
+        self._last_stats_ts = 0.0
+        self._last_bitrate_bps = 0.0
+        self._last_fps = 0.0
+        self._last_lost = 0
         return p
 
     def _ensure_player(self):
@@ -519,12 +563,76 @@ class PlayerPane(QWidget):
         if not self._is_playing:
             self._schedule_retry("open-timeout")
 
+    @staticmethod
+    def _format_rate(bps: float) -> str:
+        if bps >= 1_000_000:
+            return f"{bps / 1_000_000:.1f} Mbps"
+        if bps >= 1_000:
+            return f"{bps / 1_000:.0f} kbps"
+        return f"{int(bps)} bps"
+
+    def _update_stats(self):
+        """Once-per-second sample of libVLC's MediaStats.  Updates the
+        green overlay in the top-left of the video frame with fps and
+        bitrate, and caches the values on self so MainWindow can build
+        an aggregate across all panes."""
+        if self.player is None or not self._is_playing:
+            self.fps_label.hide()
+            self._last_bitrate_bps = 0.0
+            self._last_fps = 0.0
+            return
+
+        media = self.player.get_media()
+        if media is None:
+            return
+        try:
+            ok = media.get_stats(self._stats_struct)
+        except Exception:
+            ok = False
+        if not ok:
+            return
+
+        now = time.monotonic()
+        decoded = int(self._stats_struct.decoded_video)
+        rbytes  = int(self._stats_struct.read_bytes)
+        lost    = int(self._stats_struct.lost_pictures)
+
+        if self._last_stats_ts > 0.0:
+            dt = now - self._last_stats_ts
+            if dt > 0:
+                dv = max(0, decoded - self._last_decoded_video)
+                db = max(0, rbytes - self._last_read_bytes)
+                dl = max(0, lost - self._last_lost_pictures)
+                fps = dv / dt
+                bps = db * 8.0 / dt
+
+                self._last_fps = fps
+                self._last_bitrate_bps = bps
+                self._last_lost = dl
+
+                if dl > 0:
+                    text = f"{fps:>4.0f} fps\n{self._format_rate(bps)}\nlost {dl}"
+                else:
+                    text = f"{fps:>4.0f} fps\n{self._format_rate(bps)}"
+
+                self.fps_label.setText(text)
+                self.fps_label.adjustSize()
+                self.fps_label.show()
+                self.fps_label.raise_()
+
+        self._last_decoded_video = decoded
+        self._last_read_bytes = rbytes
+        self._last_lost_pictures = lost
+        self._last_stats_ts = now
+
     def shutdown(self):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
         if self.watchdog_timer.isActive():
             self.watchdog_timer.stop()
+        if self.stats_timer.isActive():
+            self.stats_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None
@@ -748,6 +856,13 @@ class MainWindow(QMainWindow):
         self.info.setStyleSheet("color: #ddd;")
         main.addWidget(self.info)
 
+        # Aggregate stats bar refresh — each PlayerPane samples its own
+        # stats every 1s; this timer just re-renders the total 1s later.
+        self._agg_stats_timer = QTimer(self)
+        self._agg_stats_timer.setInterval(1000)
+        self._agg_stats_timer.timeout.connect(self._update_aggregate_stats)
+        self._agg_stats_timer.start()
+
         self.panes_grid = QGridLayout()
         self.panes_grid.setSpacing(8)
         main.addLayout(self.panes_grid, 1)
@@ -848,7 +963,32 @@ class MainWindow(QMainWindow):
     def _update_focus(self):
         for p in self.panes:
             p.set_focused(p.pane_id == self.active_pane and p.isVisible())
-        self.info.setText(f"Active pane: {self.active_pane}")
+        self._update_aggregate_stats()
+
+    def _update_aggregate_stats(self):
+        """Assemble the status line: active pane + how many of the visible
+        tiles are actually playing + total network bitrate + lost frames."""
+        visible = self.panes[:max(0, self.visible_panes)]
+        playing = sum(1 for p in visible
+                      if p._is_playing and p.assigned_channel is not None)
+        total_bps = sum(p._last_bitrate_bps for p in visible)
+        total_lost = sum(p._last_lost for p in visible)
+
+        if total_bps >= 1_000_000:
+            rate = f"{total_bps / 1_000_000:.1f} Mbps"
+        elif total_bps >= 1_000:
+            rate = f"{total_bps / 1_000:.0f} kbps"
+        else:
+            rate = "0 bps"
+
+        pieces = [
+            f"Active pane: {self.active_pane}",
+            f"streams: {playing}/{len(visible)}",
+            f"total: {rate}",
+        ]
+        if total_lost > 0:
+            pieces.append(f"lost: {total_lost}")
+        self.info.setText("  |  ".join(pieces))
 
     def set_active_pane(self, pane_id: int):
         # In fullscreen, a click on the sole visible tile is "exit",
