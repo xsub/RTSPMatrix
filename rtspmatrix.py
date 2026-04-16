@@ -100,6 +100,10 @@ class RtspConfig:
         self.state_file = a.get("state_file", "state.json")
         self.log_level = a.get("log_level", "INFO")
         self.log_file = a.get("log_file", "")
+        # Delay (in ms) between opening individual RTSP streams during a
+        # batch (pane-count increase / view apply).  Set to 0 to open all
+        # at once.  200 ms smooths out the DVR+network load burst.
+        self.stagger_open_ms = int(a.get("stagger_open_ms", 200))
 
         raw_labels = cp["view"].get("labels", "") if cp.has_section("view") else ""
         self.labels = parse_labels(raw_labels)
@@ -1080,10 +1084,13 @@ class MainWindow(QMainWindow):
 
         # (Re)start saved channels for panes that just became visible — the
         # previous behaviour silently left them stuck in "(saved)".
+        batch = []
         for i in range(prev, n):
             ch = self.panes[i].assigned_channel
             if isinstance(ch, int) and self.cfg.is_channel_active(ch):
-                self.panes[i].play_channel(ch)
+                batch.append((i + 1, ch))
+        if batch:
+            self._play_batch_staggered(batch)
 
         if self.active_pane > n:
             self.active_pane = 1
@@ -1115,6 +1122,40 @@ class MainWindow(QMainWindow):
         self._apply_panes_visibility(n)
         self._save_state()
 
+    def _play_batch_staggered(self, items):
+        """Open a batch of channels sequentially with a small delay between
+        each so the DVR + network aren't hammered with N concurrent RTSP
+        handshakes.  `items` is a list of (pane_id, channel) pairs.
+
+        The pane's assigned_channel is set immediately (state is coherent)
+        so if the user reassigns a pane before its slot fires, we detect
+        the mismatch and skip the stale open."""
+        step = max(0, int(self.cfg.stagger_open_ms))
+
+        for idx, (pane_id, ch) in enumerate(items):
+            pane = self.panes[pane_id - 1]
+            pane.assigned_channel = ch
+
+            if step == 0:
+                pane.play_channel(ch)
+                continue
+
+            if idx == 0:
+                pane.play_channel(ch)
+                continue
+
+            delay = idx * step
+            pane.label.setText(
+                f"Pane {pane_id}: {self.cfg.channel_text(ch)} (queued, +{delay}ms)")
+
+            def _go(pid=pane_id, target_ch=ch):
+                p = self.panes[pid - 1]
+                # Skip if the user reassigned this pane in the meantime.
+                if p.assigned_channel != target_ch:
+                    return
+                p.play_channel(target_ch)
+            QTimer.singleShot(delay, _go)
+
     def on_channel_pressed(self, ch: int):
         log.info("user: assign CH%d -> pane %d", ch, self.active_pane)
         self.panes[self.active_pane - 1].play_channel(ch)
@@ -1134,17 +1175,35 @@ class MainWindow(QMainWindow):
         log.info("user: apply view %r", name)
         panes = int(v.get("panes", 4))
         assign = v.get("assign", [])
-        self.cmb_panes.setCurrentText(str(panes))
-        self._apply_panes_visibility(panes)
+
+        # Pre-set every pane's assigned_channel and idle the ones the view
+        # leaves empty.  _apply_panes_visibility will then read those
+        # assignments through its own staggered-open path.
         for i in range(1, 17):
             p = self.panes[i - 1]
-            if i > self.visible_panes:
-                continue
             ch = assign[i - 1] if i - 1 < len(assign) else None
-            if isinstance(ch, int) and 1 <= ch <= 16:
-                p.play_channel(ch)
+            if isinstance(ch, int) and 1 <= ch <= 16 and i <= panes:
+                p.assigned_channel = ch
+            elif i > panes:
+                # out of range for the new pane count; keep state but skip
+                pass
             else:
                 p.stop_to_idle()
+
+        self.cmb_panes.setCurrentText(str(panes))
+        # When the pane count is the same as before, _apply_panes_visibility
+        # does NOT iterate the "newly revealed" range.  Force a re-open of
+        # visible panes in that case by going through the stagger helper.
+        if self.visible_panes == panes:
+            batch = [(i, self.panes[i - 1].assigned_channel)
+                     for i in range(1, panes + 1)
+                     if isinstance(self.panes[i - 1].assigned_channel, int)
+                     and self.cfg.is_channel_active(self.panes[i - 1].assigned_channel)]
+            if batch:
+                self._play_batch_staggered(batch)
+        else:
+            self._apply_panes_visibility(panes)
+
         self._save_state()
 
     def save_view_dialog(self):
