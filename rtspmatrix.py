@@ -92,8 +92,11 @@ class RtspConfig:
         # live555 idle timeout (seconds, best-effort)
         self.rtsp_timeout_s = s.getint("rtsp_timeout_s", 4)
 
-        # macOS HW decode can deadlock on glitchy RTSP
-        self.disable_hw_decode = s.getint("disable_hw_decode", 1) != 0
+        # Hardware H.264 decode (VideoToolbox on macOS, DXVA on Win, VAAPI
+        # on Linux).  Default on — the old 1 default was a workaround for
+        # a libVLC deadlock that recent builds have fixed.  Revert to 1
+        # if a camera triggers the old symptom.
+        self.disable_hw_decode = s.getint("disable_hw_decode", 0) != 0
 
         a = cp["app"] if cp.has_section("app") else {}
         self.title = a.get("title", "RTSPMatrix")
@@ -104,8 +107,8 @@ class RtspConfig:
         self.log_file = a.get("log_file", "")
         # Delay (in ms) between opening individual RTSP streams during a
         # batch (pane-count increase / view apply).  Set to 0 to open all
-        # at once.  200 ms smooths out the DVR+network load burst.
-        self.stagger_open_ms = int(a.get("stagger_open_ms", 200))
+        # at once.  100 ms is fine for a LAN DVR on substream.
+        self.stagger_open_ms = int(a.get("stagger_open_ms", 100))
         # Enable the internal profiler (named timers / counters / gauges
         # dumped to the log every profile_dump_interval_s seconds).  Zero
         # overhead when disabled.
@@ -302,6 +305,8 @@ class PlayerPane(QWidget):
         # libVLC "time" events (one per displayed frame PTS update) which
         # is far more reliable than MediaStats.decoded_video on RTSP
         # streams.  Bitrate comes from MediaStats.input_bitrate.
+        # MainWindow drives _update_stats on a single shared timer, not
+        # per pane — cheaper than 16 separate Qt timers.
         self._time_event_count = 0
         self._last_time_event_count = 0
         self._last_decoded_video = 0
@@ -311,10 +316,6 @@ class PlayerPane(QWidget):
         self._last_bitrate_bps = 0.0
         self._last_fps = 0.0
         self._last_lost = 0
-        self.stats_timer = QTimer(self)
-        self.stats_timer.setInterval(1000)
-        self.stats_timer.timeout.connect(self._update_stats)
-        self.stats_timer.start()
 
         QTimer.singleShot(0, self._ensure_player)
 
@@ -426,11 +427,12 @@ class PlayerPane(QWidget):
             self.watchdog_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
-        self.player = self._new_player()
+            self.player = None  # _ensure_player will lazily recreate it
         self._retry_attempt = 0
         self._opening_since_ts = 0.0
         self._last_progress_ts = 0.0
         self._is_playing = False
+        self.fps_label.hide()
         if keep_channel and self.assigned_channel is not None:
             self.label.setText(
                 f"Pane {self.pane_id}: {self.cfg.channel_text(self.assigned_channel)} (hidden)")
@@ -709,8 +711,6 @@ class PlayerPane(QWidget):
             self.open_timer.stop()
         if self.watchdog_timer.isActive():
             self.watchdog_timer.stop()
-        if self.stats_timer.isActive():
-            self.stats_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None
@@ -934,12 +934,22 @@ class MainWindow(QMainWindow):
         self.info.setStyleSheet("color: #ddd;")
         main.addWidget(self.info)
 
-        # Aggregate stats bar refresh — each PlayerPane samples its own
-        # stats every 1s; this timer just re-renders the total 1s later.
-        self._agg_stats_timer = QTimer(self)
-        self._agg_stats_timer.setInterval(1000)
-        self._agg_stats_timer.timeout.connect(self._update_aggregate_stats)
-        self._agg_stats_timer.start()
+        # Single stats-refresh timer: updates every pane's FPS/bitrate
+        # overlay, then rebuilds the aggregate status line in one tick.
+        # One Qt timer instead of 16 per-pane timers.
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._tick_stats)
+        self._stats_timer.start()
+
+        # Debounced state saver: user actions (channel press, pane count
+        # change, active pane, orientation) request a save, but the actual
+        # disk write happens 500 ms after the last request.  Rapid
+        # clicking no longer hammers the JSON file.
+        self._save_state_timer = QTimer(self)
+        self._save_state_timer.setSingleShot(True)
+        self._save_state_timer.setInterval(500)
+        self._save_state_timer.timeout.connect(self._save_state)
 
         # Profiler plumbing: a periodic dump timer + a tight event-loop
         # tick that measures scheduling jitter (if the jitter spikes,
@@ -1055,9 +1065,21 @@ class MainWindow(QMainWindow):
     def _save_state(self):
         safe_write_json(self.cfg.state_file, self._state_snapshot())
 
+    def _request_save_state(self):
+        """Debounced state save.  Restarts the 500 ms timer on every call
+        so rapid clicks coalesce into a single write."""
+        self._save_state_timer.start()
+
     def _update_focus(self):
         for p in self.panes:
             p.set_focused(p.pane_id == self.active_pane and p.isVisible())
+        self._update_aggregate_stats()
+
+    def _tick_stats(self):
+        """Shared 1 Hz stats tick: sample every pane's libVLC stats first,
+        then rebuild the aggregate status bar from the cached values."""
+        for p in self.panes:
+            p._update_stats()
         self._update_aggregate_stats()
 
     def _update_aggregate_stats(self):
@@ -1123,7 +1145,7 @@ class MainWindow(QMainWindow):
             return
         self.active_pane = pane_id
         self._update_focus()
-        self._save_state()
+        self._request_save_state()
 
     # ---------- fullscreen ----------
 
@@ -1361,7 +1383,7 @@ class MainWindow(QMainWindow):
         self._update_orient_button()
         self._rebuild_grid()
         self._update_focus()
-        self._save_state()
+        self._request_save_state()
 
     def _on_panes_changed(self, txt: str):
         try:
@@ -1369,7 +1391,7 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         self._apply_panes_visibility(n)
-        self._save_state()
+        self._request_save_state()
 
     def _play_batch_staggered(self, items):
         """Open a batch of channels sequentially with a small delay between
@@ -1408,11 +1430,11 @@ class MainWindow(QMainWindow):
     def on_channel_pressed(self, ch: int):
         log.info("user: assign CH%d -> pane %d", ch, self.active_pane)
         self.panes[self.active_pane - 1].play_channel(ch)
-        self._save_state()
+        self._request_save_state()
 
     def clear_active_pane(self):
         self.panes[self.active_pane - 1].stop_to_idle()
-        self._save_state()
+        self._request_save_state()
 
     def apply_selected_view(self):
         name = self.cmb_views.currentText().strip()
@@ -1453,7 +1475,7 @@ class MainWindow(QMainWindow):
         else:
             self._apply_panes_visibility(panes)
 
-        self._save_state()
+        self._request_save_state()
 
     def save_view_dialog(self):
         name, ok = QInputDialog.getText(self, "Save View", "View name:")
@@ -1495,6 +1517,10 @@ class MainWindow(QMainWindow):
         self._cleaned = True
         log.info("shutting down")
         self._close_fullscreen_if_any()
+        # Flush any pending debounced save synchronously so we don't lose
+        # the last state change.
+        if self._save_state_timer.isActive():
+            self._save_state_timer.stop()
         self._save_state()
         for p in self.panes:
             p.shutdown()
