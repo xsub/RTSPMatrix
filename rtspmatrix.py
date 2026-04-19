@@ -45,16 +45,30 @@ if sys.platform.startswith("win"):
 try:
     import vlc
 except OSError as _vlc_err:
-    print("ERROR: Could not load libVLC.", file=sys.stderr)
+    print("ERROR: Could not load libVLC (the library, not the player).",
+          file=sys.stderr)
     if sys.platform.startswith("win"):
+        # On Windows libvlc.dll ships inside the VLC installer — there is
+        # no standalone SDK package for end users.
         print("  Install VLC from https://www.videolan.org/vlc/", file=sys.stderr)
-        print("  Or set VLC_PATH=C:\\path\\to\\VLC in your environment.", file=sys.stderr)
+        print("  (only the libvlc DLLs are used, the player UI is not needed)",
+              file=sys.stderr)
+        print("  Or set VLC_PATH=C:\\path\\to\\VLC in your environment.",
+              file=sys.stderr)
     elif sys.platform.startswith("darwin"):
-        print("  Install VLC: brew install --cask vlc", file=sys.stderr)
+        # On macOS libvlc.dylib lives inside VLC.app.
+        print("  brew install --cask vlc", file=sys.stderr)
+        print("  (only libvlc inside VLC.app is used, not the player UI)",
+              file=sys.stderr)
     else:
-        print("  Debian/Ubuntu: sudo apt install vlc libvlc-dev", file=sys.stderr)
-        print("  AlmaLinux/Fedora: sudo dnf install vlc vlc-devel", file=sys.stderr)
-        print("  Arch:          sudo pacman -S vlc", file=sys.stderr)
+        # On Linux libvlc is a separate package from the VLC player.
+        print("  Debian/Ubuntu:    sudo apt install libvlc5 vlc-plugin-base",
+              file=sys.stderr)
+        print("  AlmaLinux/Fedora: sudo dnf install libvlc vlc-plugins-base",
+              file=sys.stderr)
+        print("  Arch:             sudo pacman -S vlc", file=sys.stderr)
+        print("  (the full 'vlc' player package also works but is not required)",
+              file=sys.stderr)
     raise SystemExit(1) from _vlc_err
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
 from PyQt5.QtGui import QGuiApplication, QIcon, QPixmap

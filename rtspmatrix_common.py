@@ -36,7 +36,14 @@ if sys.platform.startswith("win"):
 try:
     import vlc
 except OSError:
-    print("ERROR: Could not load libVLC. Install VLC first.", file=sys.stderr)
+    print("ERROR: Could not load libVLC.", file=sys.stderr)
+    if sys.platform.startswith("linux"):
+        print("  sudo apt install libvlc5 vlc-plugin-base  (Debian/Ubuntu)",
+              file=sys.stderr)
+    elif sys.platform.startswith("win"):
+        print("  Install VLC from https://www.videolan.org/vlc/", file=sys.stderr)
+    else:
+        print("  brew install --cask vlc  (macOS)", file=sys.stderr)
     raise SystemExit(1)
 
 
