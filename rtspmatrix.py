@@ -16,7 +16,17 @@ import time
 import configparser
 import importlib.metadata
 
-# On Windows, python-vlc needs libvlc.dll on PATH.  VLC's installer
+# ---------- platform bootstrap ----------
+
+# Linux / Wayland: VLC's set_xwindow() requires a real X11 window.  On
+# Wayland desktops, Qt must use the XCB (XWayland) backend so that
+# winId() returns a valid X11 window handle.  setdefault means the user
+# can still override with QT_QPA_PLATFORM=wayland if they know what
+# they're doing, but the default is safe.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+# Windows: python-vlc needs libvlc.dll on PATH.  VLC's installer
 # doesn't always add itself to PATH, so we search common locations.
 if sys.platform.startswith("win"):
     _vlc_search = [
@@ -42,7 +52,9 @@ except OSError as _vlc_err:
     elif sys.platform.startswith("darwin"):
         print("  Install VLC: brew install --cask vlc", file=sys.stderr)
     else:
-        print("  Install VLC: sudo apt install vlc  (or equivalent)", file=sys.stderr)
+        print("  Debian/Ubuntu: sudo apt install vlc libvlc-dev", file=sys.stderr)
+        print("  Fedora:        sudo dnf install vlc vlc-devel", file=sys.stderr)
+        print("  Arch:          sudo pacman -S vlc", file=sys.stderr)
     raise SystemExit(1) from _vlc_err
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
 from PyQt5.QtGui import QGuiApplication, QIcon, QPixmap

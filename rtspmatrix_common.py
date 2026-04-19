@@ -13,8 +13,12 @@ import sys
 import threading
 import time
 
-# On Windows, python-vlc needs libvlc.dll on PATH.  VLC's installer
-# doesn't always add itself to PATH, so we search common locations.
+# Linux / Wayland: force XCB (XWayland) backend so VLC's set_xwindow
+# gets a real X11 window handle from Qt's winId().
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+# Windows: python-vlc needs libvlc.dll on PATH.
 if sys.platform.startswith("win"):
     _vlc_search = [
         os.environ.get("VLC_PATH", ""),
