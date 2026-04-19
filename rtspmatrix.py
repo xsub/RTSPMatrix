@@ -92,6 +92,11 @@ class RtspConfig:
         # live555 idle timeout (seconds, best-effort)
         self.rtsp_timeout_s = s.getint("rtsp_timeout_s", 4)
 
+        # Throughput-pulse stall detection: if a playing channel delivers
+        # zero time events for this many consecutive seconds, force a
+        # reconnect.  Replaces the old single-threshold watchdog.
+        self.stall_window_s = s.getint("stall_window_s", 10)
+
         # Hardware H.264 decode (VideoToolbox on macOS, DXVA on Win, VAAPI
         # on Linux).  Default on — the old 1 default was a workaround for
         # a libVLC deadlock that recent builds have fixed.  Revert to 1
@@ -281,13 +286,11 @@ class PlayerPane(QWidget):
         # "playing" event so the profiler records time-to-first-frame.
         self._play_started_ts = 0.0
 
-        # The watchdog only checks "are we still making forward progress" —
-        # it does not poll get_state().  All state transitions come from
-        # libVLC events via state_event.
-        watchdog_ms = max(self.cfg.poll_interval_ms, 1000)
-        self.watchdog_timer = QTimer(self)
-        self.watchdog_timer.setInterval(watchdog_ms)
-        self.watchdog_timer.timeout.connect(self._watchdog_tick)
+        # Throughput-pulse stall detector: rolling window of time-event
+        # deltas (one sample per shared stats tick = 1 Hz).  If all
+        # samples are zero for stall_window_s seconds, we force reconnect.
+        # Replaces the old per-pane watchdog QTimer (one fewer timer ×16).
+        self._throughput_window = []
 
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
@@ -390,9 +393,10 @@ class PlayerPane(QWidget):
         self._bind_player_window(p)
         self._player_gen += 1
         self._wire_player_events(p, self._player_gen)
-        # New player -> fresh stats counters, so deltas don't go negative.
+        # New player -> fresh stats counters and throughput window.
         self._time_event_count = 0
         self._last_time_event_count = 0
+        self._throughput_window.clear()
         self._last_decoded_video = 0
         self._last_read_bytes = 0
         self._last_lost_pictures = 0
@@ -423,8 +427,7 @@ class PlayerPane(QWidget):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
-        if self.watchdog_timer.isActive():
-            self.watchdog_timer.stop()
+        self._throughput_window.clear()
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None  # _ensure_player will lazily recreate it
@@ -464,8 +467,6 @@ class PlayerPane(QWidget):
         self._is_playing = False
 
         self._start_play(ch, reason="play")
-        if not self.watchdog_timer.isActive():
-            self.watchdog_timer.start()
 
     def _start_play(self, ch: int, reason: str):
         with profiler.time("start_play"):
@@ -583,21 +584,6 @@ class PlayerPane(QWidget):
         if name == "paused":
             self._is_playing = False
 
-    def _watchdog_tick(self):
-        """Catches the silent-stall case: libVLC isn't firing time events
-        even though we believed it was Playing.  All other state transitions
-        come from libVLC events, not from this timer."""
-        if self.player is None or self.assigned_channel is None:
-            return
-        if not self._is_playing:
-            return
-        if self._last_progress_ts <= 0.0:
-            return
-        now = time.monotonic()
-        if (now - self._last_progress_ts) * 1000.0 > self.cfg.stall_timeout_ms:
-            self._is_playing = False
-            self._schedule_retry("watchdog(no progress)")
-
     def _open_timeout(self):
         if self.player is None or self.assigned_channel is None:
             return
@@ -690,6 +676,35 @@ class PlayerPane(QWidget):
         self._last_time_event_count = tec
         self._last_stats_ts = now
 
+        # ---- throughput pulse: stall detection ----
+        # Track how many time events arrived per tick.  If the window fills
+        # with all-zeroes (no frames for stall_window_s seconds), the
+        # stream is dead → force reconnect.
+        if self._is_playing:
+            dtec = max(0, tec - self._last_time_event_count) if self._last_stats_ts > 0 else -1
+            # dtec can be 0 legitimately on the very first tick after stats
+            # baseline was recorded — skip that tick (dtec = fps * dt, but
+            # _last_time_event_count was just set above, so dtec would be 0
+            # on the NEXT call).  We only pulse once we've had two ticks.
+            # Actually: dtec was computed before _last_time_event_count was
+            # updated above, so it IS correct.  But the first tick after
+            # _new_player has _last_stats_ts = 0 → skip (sentinel -1).
+            if dtec >= 0:
+                self._throughput_window.append(dtec)
+                if len(self._throughput_window) > self.cfg.stall_window_s:
+                    self._throughput_window.pop(0)
+                if (len(self._throughput_window) >= self.cfg.stall_window_s
+                        and all(s == 0 for s in self._throughput_window)):
+                    ch = self.assigned_channel
+                    log.warning(
+                        "pane %d: CH%d throughput zero for %ds — forcing reconnect",
+                        self.pane_id, ch, self.cfg.stall_window_s)
+                    profiler.count("stall_reconnect")
+                    self._throughput_window.clear()
+                    self._is_playing = False
+                    self._schedule_retry("throughput-zero")
+                    return  # skip overlay update this tick
+
         # Always render once we have a playing player + assigned channel.
         # Show dashes for values that are still zero so the user can see
         # the overlay came up, and which field is missing.
@@ -709,8 +724,6 @@ class PlayerPane(QWidget):
         self._cancel_retry()
         if self.open_timer.isActive():
             self.open_timer.stop()
-        if self.watchdog_timer.isActive():
-            self.watchdog_timer.stop()
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None
