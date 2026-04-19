@@ -13,7 +13,27 @@ import sys
 import threading
 import time
 
-import vlc
+# On Windows, python-vlc needs libvlc.dll on PATH.  VLC's installer
+# doesn't always add itself to PATH, so we search common locations.
+if sys.platform.startswith("win"):
+    _vlc_search = [
+        os.environ.get("VLC_PATH", ""),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "VideoLAN", "VLC"),
+        os.path.join(os.environ.get("ProgramFiles(x86)",
+                                    r"C:\Program Files (x86)"),
+                     "VideoLAN", "VLC"),
+    ]
+    for _vp in _vlc_search:
+        if _vp and os.path.isfile(os.path.join(_vp, "libvlc.dll")):
+            os.environ["PATH"] = _vp + os.pathsep + os.environ.get("PATH", "")
+            break
+
+try:
+    import vlc
+except OSError:
+    print("ERROR: Could not load libVLC. Install VLC first.", file=sys.stderr)
+    raise SystemExit(1)
 
 
 log = logging.getLogger("rtspmatrix")

@@ -16,7 +16,34 @@ import time
 import configparser
 import importlib.metadata
 
-import vlc
+# On Windows, python-vlc needs libvlc.dll on PATH.  VLC's installer
+# doesn't always add itself to PATH, so we search common locations.
+if sys.platform.startswith("win"):
+    _vlc_search = [
+        os.environ.get("VLC_PATH", ""),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "VideoLAN", "VLC"),
+        os.path.join(os.environ.get("ProgramFiles(x86)",
+                                    r"C:\Program Files (x86)"),
+                     "VideoLAN", "VLC"),
+    ]
+    for _vp in _vlc_search:
+        if _vp and os.path.isfile(os.path.join(_vp, "libvlc.dll")):
+            os.environ["PATH"] = _vp + os.pathsep + os.environ.get("PATH", "")
+            break
+
+try:
+    import vlc
+except OSError as _vlc_err:
+    print("ERROR: Could not load libVLC.", file=sys.stderr)
+    if sys.platform.startswith("win"):
+        print("  Install VLC from https://www.videolan.org/vlc/", file=sys.stderr)
+        print("  Or set VLC_PATH=C:\\path\\to\\VLC in your environment.", file=sys.stderr)
+    elif sys.platform.startswith("darwin"):
+        print("  Install VLC: brew install --cask vlc", file=sys.stderr)
+    else:
+        print("  Install VLC: sudo apt install vlc  (or equivalent)", file=sys.stderr)
+    raise SystemExit(1) from _vlc_err
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
 from PyQt5.QtGui import QGuiApplication, QIcon, QPixmap
 from PyQt5.QtWidgets import (
