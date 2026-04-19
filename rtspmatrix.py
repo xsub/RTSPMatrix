@@ -807,16 +807,11 @@ class PlayerPane(QWidget):
             self.player = None
 
 
-ABOUT_LOGO_CANDIDATES = (
-    "RTSPMatrix_logo.png",
-    os.path.join("assets", "RTSPMatrix_logo.png"),
-    "puffy-clouds-logo.png",
-    os.path.join("assets", "puffy-clouds-logo.png"),
-)
+ABOUT_LOGO = "puffy-clouds-logo.png"
 
 
-def _find_about_logo():
-    for p in ABOUT_LOGO_CANDIDATES:
+def _find_logo(name):
+    for p in (name, os.path.join("assets", name)):
         if os.path.isfile(p):
             return p
     return None
@@ -826,56 +821,52 @@ class AboutDialog(QDialog):
     def __init__(self, parent, cfg: RtspConfig, panes: int):
         super().__init__(parent)
         self.setWindowTitle("About RTSPMatrix")
-        self.resize(720, 620)
+        self.setMinimumSize(680, 560)
+        self.resize(740, 640)
+        self.setStyleSheet("""
+            QDialog { background: #1e1e1e; }
+            QLabel  { color: #ddd; }
+        """)
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(16, 16, 16, 12)
-        v.setSpacing(12)
+        v.setContentsMargins(24, 20, 24, 16)
+        v.setSpacing(0)
 
-        # ---- branding header ----
-        logo_path = _find_about_logo()
-        logo_is_rtspmatrix = bool(logo_path and "RTSPMatrix_logo" in logo_path)
+        # ---- Puffy Clouds branding ----
+        logo_path = _find_logo(ABOUT_LOGO)
         if logo_path:
             pm = QPixmap(logo_path)
             if not pm.isNull():
-                scaled = pm.scaledToWidth(560, Qt.SmoothTransformation)
-                logo = QLabel(self)
-                logo.setPixmap(scaled)
-                logo.setAlignment(Qt.AlignCenter)
-                # The RTSPMatrix logo ships with its own dark background and
-                # baked-in title; don't put it on a white card.  The Puffy
-                # Clouds fallback is dark-on-white, so it gets the card.
-                if not logo_is_rtspmatrix:
-                    logo.setStyleSheet("background: white; padding: 12px; border-radius: 6px;")
-                v.addWidget(logo, 0, Qt.AlignCenter)
+                scaled = pm.scaledToWidth(320, Qt.SmoothTransformation)
+                logo_lbl = QLabel(self)
+                logo_lbl.setPixmap(scaled)
+                logo_lbl.setAlignment(Qt.AlignCenter)
+                v.addWidget(logo_lbl, 0, Qt.AlignCenter)
+                v.addSpacing(6)
 
-        # The RTSPMatrix logo already renders the app name + tagline.  For
-        # the fallback (Puffy Clouds) we still need an explicit title row.
-        if not logo_is_rtspmatrix:
-            title = QLabel(f"<h2 style='margin:0'>{cfg.title}</h2>", self)
-            title.setAlignment(Qt.AlignCenter)
-            v.addWidget(title)
+        # ---- app name + tagline ----
+        title = QLabel(
+            f"<span style='font-size:22px; font-weight:bold; color:#fff;'>"
+            f"{cfg.title}</span>", self)
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title)
 
-            subtitle = QLabel("RTSP grid viewer for Dahua / compatible DVR-NVR devices",
-                              self)
-            subtitle.setAlignment(Qt.AlignCenter)
-            subtitle.setStyleSheet("color: #aaa;")
-            v.addWidget(subtitle)
+        tagline = QLabel(
+            "<span style='font-size:12px; color:#888;'>"
+            "Lightweight RTSP grid viewer for Dahua / compatible DVR-NVR"
+            "</span>", self)
+        tagline.setAlignment(Qt.AlignCenter)
+        v.addWidget(tagline)
+        v.addSpacing(14)
 
-        # ---- runtime / config info ----
-        text = QTextEdit(self)
-        text.setReadOnly(True)
-        text.setStyleSheet("font-family: monospace; font-size: 11px;")
-
-        py_ver = sys.version.replace("\n", " ")
+        # ---- info as styled HTML table ----
+        py_ver = sys.version.split()[0]
         qt_ver = QT_VERSION_STR
         pyqt_ver = PYQT_VERSION_STR
-
         try:
             pv_vlc = importlib.metadata.version("python-vlc")
         except Exception:
-            pv_vlc = "unknown"
-
+            pv_vlc = "?"
         try:
             libvlc_ver = vlc.libvlc_get_version()
             if isinstance(libvlc_ver, bytes):
@@ -883,49 +874,92 @@ class AboutDialog(QDialog):
             else:
                 libvlc_ver = str(libvlc_ver)
         except Exception:
-            libvlc_ver = "unknown"
+            libvlc_ver = "?"
 
-        info = []
-        info.append(f"App: {cfg.title}")
-        info.append(f"OS: {platform.platform()}")
-        info.append(f"Python: {py_ver}")
-        info.append(f"Qt: {qt_ver}")
-        info.append(f"PyQt5: {pyqt_ver}")
-        info.append(f"python-vlc: {pv_vlc}")
-        info.append(f"libVLC: {libvlc_ver}")
-        info.append("")
-        info.append(f"RTSP host: {cfg.host}:{cfg.port}")
-        info.append(f"RTSP path: {cfg.path}")
-        info.append(f"TCP: {cfg.tcp}")
-        info.append(f"network_caching_ms: {cfg.network_caching_ms}")
-        info.append(f"open_timeout_ms: {cfg.open_timeout_ms}")
-        info.append(f"poll_interval_ms: {cfg.poll_interval_ms}")
-        info.append(f"stall_timeout_ms: {cfg.stall_timeout_ms}")
-        info.append(f"retry_base_ms: {cfg.retry_base_ms}")
-        info.append(f"retry_max_ms: {cfg.retry_max_ms}")
-        info.append(f"rtsp_timeout_s: {cfg.rtsp_timeout_s}")
-        info.append(f"disable_hw_decode: {cfg.disable_hw_decode}")
-        info.append("")
-        info.append(f"Active panes: {panes}")
-        info.append(f"Config: rtsp.ini")
-        info.append(f"Views file: {cfg.views_file}")
-        info.append(f"State file: {cfg.state_file}")
+        hw = "ON" if not cfg.disable_hw_decode else "OFF (software)"
+        sub_tile = cfg.subtype_tile
+        sub_full = cfg.subtype_full
 
-        content = "\n".join(info)
-        text.setPlainText(content)
-        v.addWidget(text, 1)
+        def row(label, value):
+            return (f"<tr>"
+                    f"<td style='padding:2px 12px 2px 0; color:#888;'>{label}</td>"
+                    f"<td style='padding:2px 0; color:#ccc;'>{value}</td>"
+                    f"</tr>")
+
+        html = "<table cellspacing='0' style='font-size:12px; font-family:monospace;'>"
+        html += "<tr><td colspan='2' style='padding:4px 0 2px; color:#66aaff; font-weight:bold;'>System</td></tr>"
+        html += row("OS", platform.platform())
+        html += row("Python", py_ver)
+        html += row("Qt / PyQt5", f"{qt_ver} / {pyqt_ver}")
+        html += row("libVLC", libvlc_ver)
+        html += row("python-vlc", pv_vlc)
+
+        html += "<tr><td colspan='2' style='padding:10px 0 2px; color:#66aaff; font-weight:bold;'>Connection</td></tr>"
+        html += row("RTSP host", f"{cfg.host}:{cfg.port}")
+        html += row("Path", cfg.path)
+        html += row("Transport", "TCP" if cfg.tcp else "UDP")
+        html += row("HW decode", hw)
+        html += row("Subtype (tile / full)", f"{sub_tile} / {sub_full}")
+        html += row("Network cache", f"{cfg.network_caching_ms} ms")
+        html += row("Open timeout", f"{cfg.open_timeout_ms} ms")
+        html += row("RTSP timeout", f"{cfg.rtsp_timeout_s} s")
+
+        html += "<tr><td colspan='2' style='padding:10px 0 2px; color:#66aaff; font-weight:bold;'>Resilience</td></tr>"
+        html += row("Retry base / max", f"{cfg.retry_base_ms} / {cfg.retry_max_ms} ms")
+        html += row("Stall window", f"{cfg.stall_window_s} s")
+        html += row("Stagger open", f"{cfg.stagger_open_ms} ms")
+
+        html += "<tr><td colspan='2' style='padding:10px 0 2px; color:#66aaff; font-weight:bold;'>Layout</td></tr>"
+        html += row("Active panes", str(panes))
+        html += row("Config file", "rtsp.ini")
+        html += row("Views file", cfg.views_file)
+        html += row("State file", cfg.state_file)
+        html += "</table>"
+
+        info = QLabel(html, self)
+        info.setTextFormat(Qt.RichText)
+        info.setWordWrap(True)
+        info.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        info.setStyleSheet("background: transparent;")
+        v.addWidget(info, 1)
+
+        # Plain-text version for clipboard
+        self._plain = "\n".join([
+            f"{cfg.title}",
+            f"OS: {platform.platform()}",
+            f"Python: {py_ver}  Qt: {qt_ver}  PyQt5: {pyqt_ver}",
+            f"libVLC: {libvlc_ver}  python-vlc: {pv_vlc}",
+            f"RTSP: {cfg.host}:{cfg.port}{cfg.path}  TCP={cfg.tcp}  HW={hw}",
+            f"Subtype tile/full: {sub_tile}/{sub_full}  cache={cfg.network_caching_ms}ms",
+            f"Retry: {cfg.retry_base_ms}/{cfg.retry_max_ms}ms  stall={cfg.stall_window_s}s",
+            f"Panes: {panes}  stagger={cfg.stagger_open_ms}ms",
+        ])
+
+        v.addSpacing(12)
+
+        # ---- Puffy Clouds credit ----
+        credit = QLabel(
+            "<span style='font-size:10px; color:#555;'>"
+            "Powered by libVLC &middot; Built by Puffy Clouds"
+            "</span>", self)
+        credit.setAlignment(Qt.AlignCenter)
+        v.addWidget(credit)
+        v.addSpacing(8)
 
         # ---- buttons ----
-        btn_copy = QPushButton("Copy", self)
+        btn_copy = QPushButton("Copy info", self)
         btn_close = QPushButton("Close", self)
-        btn_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(content))
+        btn_copy.setStyleSheet("padding: 6px 16px;")
+        btn_close.setStyleSheet("padding: 6px 16px;")
+        btn_copy.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(self._plain))
         btn_close.clicked.connect(self.accept)
 
-        row = QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(btn_copy)
-        row.addWidget(btn_close)
-        v.addLayout(row)
+        row_btns = QHBoxLayout()
+        row_btns.addStretch(1)
+        row_btns.addWidget(btn_copy)
+        row_btns.addWidget(btn_close)
+        v.addLayout(row_btns)
 
 
 class MainWindow(QMainWindow):
