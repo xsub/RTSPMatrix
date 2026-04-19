@@ -92,10 +92,11 @@ class RtspConfig:
         # live555 idle timeout (seconds, best-effort)
         self.rtsp_timeout_s = s.getint("rtsp_timeout_s", 4)
 
-        # Throughput-pulse stall detection: if a playing channel delivers
-        # zero time events for this many consecutive seconds, force a
-        # reconnect.  Replaces the old single-threshold watchdog.
-        self.stall_window_s = s.getint("stall_window_s", 10)
+        # Throughput-pulse stall detection: if a playing channel shows zero
+        # activity (no time events, no decoded frames, no lost frames) for
+        # this many consecutive seconds, force a reconnect.  Set to 0 to
+        # disable entirely and rely only on libVLC error/ended events.
+        self.stall_window_s = s.getint("stall_window_s", 30)
 
         # Hardware H.264 decode (VideoToolbox on macOS, DXVA on Win, VAAPI
         # on Linux).  Default on — the old 1 default was a workaround for
@@ -286,11 +287,14 @@ class PlayerPane(QWidget):
         # "playing" event so the profiler records time-to-first-frame.
         self._play_started_ts = 0.0
 
-        # Throughput-pulse stall detector: rolling window of time-event
-        # deltas (one sample per shared stats tick = 1 Hz).  If all
-        # samples are zero for stall_window_s seconds, we force reconnect.
-        # Replaces the old per-pane watchdog QTimer (one fewer timer ×16).
+        # Throughput-pulse stall detector.  A stream is "alive" if ANY of
+        # {time_events, decoded_video, lost_pictures} changed since last
+        # tick.  Only if ALL are frozen for stall_window_s seconds do we
+        # reconnect.  Set stall_window_s = 0 in rtsp.ini to disable.
         self._throughput_window = []
+        self._prev_pulse_tec = 0
+        self._prev_pulse_decoded = 0
+        self._prev_pulse_lost = 0
 
         self.open_timer = QTimer(self)
         self.open_timer.setSingleShot(True)
@@ -397,6 +401,9 @@ class PlayerPane(QWidget):
         self._time_event_count = 0
         self._last_time_event_count = 0
         self._throughput_window.clear()
+        self._prev_pulse_tec = 0
+        self._prev_pulse_decoded = 0
+        self._prev_pulse_lost = 0
         self._last_decoded_video = 0
         self._last_read_bytes = 0
         self._last_lost_pictures = 0
@@ -428,6 +435,9 @@ class PlayerPane(QWidget):
         if self.open_timer.isActive():
             self.open_timer.stop()
         self._throughput_window.clear()
+        self._prev_pulse_tec = 0
+        self._prev_pulse_decoded = 0
+        self._prev_pulse_lost = 0
         if self.player is not None:
             dispose_player_async(self.player)
             self.player = None  # _ensure_player will lazily recreate it
@@ -677,33 +687,41 @@ class PlayerPane(QWidget):
         self._last_stats_ts = now
 
         # ---- throughput pulse: stall detection ----
-        # Track how many time events arrived per tick.  If the window fills
-        # with all-zeroes (no frames for stall_window_s seconds), the
-        # stream is dead → force reconnect.
-        if self._is_playing:
-            dtec = max(0, tec - self._last_time_event_count) if self._last_stats_ts > 0 else -1
-            # dtec can be 0 legitimately on the very first tick after stats
-            # baseline was recorded — skip that tick (dtec = fps * dt, but
-            # _last_time_event_count was just set above, so dtec would be 0
-            # on the NEXT call).  We only pulse once we've had two ticks.
-            # Actually: dtec was computed before _last_time_event_count was
-            # updated above, so it IS correct.  But the first tick after
-            # _new_player has _last_stats_ts = 0 → skip (sentinel -1).
-            if dtec >= 0:
-                self._throughput_window.append(dtec)
-                if len(self._throughput_window) > self.cfg.stall_window_s:
-                    self._throughput_window.pop(0)
-                if (len(self._throughput_window) >= self.cfg.stall_window_s
-                        and all(s == 0 for s in self._throughput_window)):
-                    ch = self.assigned_channel
-                    log.warning(
-                        "pane %d: CH%d throughput zero for %ds — forcing reconnect",
-                        self.pane_id, ch, self.cfg.stall_window_s)
-                    profiler.count("stall_reconnect")
-                    self._throughput_window.clear()
-                    self._is_playing = False
-                    self._schedule_retry("throughput-zero")
-                    return  # skip overlay update this tick
+        # A stream is "alive" if ANY of {time_events, decoded_video,
+        # lost_pictures} changed since the last tick.  We track a rolling
+        # window of alive/dead booleans (1 per second).  Only if the
+        # entire window is dead (ALL signals frozen for stall_window_s
+        # consecutive seconds) do we force a reconnect.
+        # Set stall_window_s = 0 in rtsp.ini to disable entirely.
+        stall_win = self.cfg.stall_window_s
+        if self._is_playing and stall_win > 0:
+            cur_tec     = self._time_event_count
+            cur_decoded = self._last_decoded_video
+            cur_lost    = self._last_lost_pictures
+
+            alive = (cur_tec     != self._prev_pulse_tec
+                     or cur_decoded != self._prev_pulse_decoded
+                     or cur_lost    != self._prev_pulse_lost)
+
+            self._prev_pulse_tec     = cur_tec
+            self._prev_pulse_decoded = cur_decoded
+            self._prev_pulse_lost    = cur_lost
+
+            self._throughput_window.append(1 if alive else 0)
+            if len(self._throughput_window) > stall_win:
+                self._throughput_window.pop(0)
+
+            if (len(self._throughput_window) >= stall_win
+                    and all(s == 0 for s in self._throughput_window)):
+                ch = self.assigned_channel
+                log.warning(
+                    "pane %d: CH%d all signals frozen for %ds — reconnect",
+                    self.pane_id, ch, stall_win)
+                profiler.count("stall_reconnect")
+                self._throughput_window.clear()
+                self._is_playing = False
+                self._schedule_retry("throughput-zero")
+                return  # skip overlay update this tick
 
         # Always render once we have a playing player + assigned channel.
         # Show dashes for values that are still zero so the user can see
