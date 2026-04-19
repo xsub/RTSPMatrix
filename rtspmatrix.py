@@ -53,7 +53,7 @@ except OSError as _vlc_err:
         print("  Install VLC: brew install --cask vlc", file=sys.stderr)
     else:
         print("  Debian/Ubuntu: sudo apt install vlc libvlc-dev", file=sys.stderr)
-        print("  Fedora:        sudo dnf install vlc vlc-devel", file=sys.stderr)
+        print("  AlmaLinux/Fedora: sudo dnf install vlc vlc-devel", file=sys.stderr)
         print("  Arch:          sudo pacman -S vlc", file=sys.stderr)
     raise SystemExit(1) from _vlc_err
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QT_VERSION_STR, PYQT_VERSION_STR
