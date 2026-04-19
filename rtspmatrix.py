@@ -243,26 +243,6 @@ class PlayerPane(QWidget):
         self.frame.clicked.connect(self._clicked)
         self.frame.doubleClicked.connect(self._dblclicked)
 
-        # Stats overlay in top-left of the video frame.  WA_NativeWindow so
-        # it gets its own NSView / X window and stacks above the libVLC
-        # render surface on macOS (a plain QLabel child would be obscured
-        # by the Metal/CoreGraphics output).
-        self.fps_label = QLabel("", self.frame)
-        self.fps_label.setAttribute(Qt.WA_NativeWindow, True)
-        self.fps_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.fps_label.setStyleSheet(
-            "QLabel {"
-            " color: #00ff00;"
-            " font-family: 'Courier New', 'Courier', 'Menlo', monospace;"
-            " font-size: 12px;"
-            " font-weight: bold;"
-            " background: rgba(0, 0, 0, 150);"
-            " padding: 2px 4px;"
-            "}"
-        )
-        self.fps_label.move(5, 5)
-        self.fps_label.hide()
-
         self.label = QLabel(f"Pane {pane_id}: Idle", self)
         self.label.setStyleSheet("color: #ddd;")
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -400,6 +380,7 @@ class PlayerPane(QWidget):
         # New player -> fresh stats counters and throughput window.
         self._time_event_count = 0
         self._last_time_event_count = 0
+        self._marquee_enabled = False
         self._throughput_window.clear()
         self._prev_pulse_tec = 0
         self._prev_pulse_decoded = 0
@@ -445,7 +426,6 @@ class PlayerPane(QWidget):
         self._opening_since_ts = 0.0
         self._last_progress_ts = 0.0
         self._is_playing = False
-        self.fps_label.hide()
         if keep_channel and self.assigned_channel is not None:
             self.label.setText(
                 f"Pane {self.pane_id}: {self.cfg.channel_text(self.assigned_channel)} (hidden)")
@@ -621,7 +601,6 @@ class PlayerPane(QWidget):
 
     def _update_stats_impl(self):
         if self.player is None or self.assigned_channel is None:
-            self.fps_label.hide()
             self._last_bitrate_bps = 0.0
             self._last_fps = 0.0
             self._last_lost = 0
@@ -650,9 +629,15 @@ class PlayerPane(QWidget):
             except Exception:
                 ok = False
             if ok:
-                rbytes = int(stats.read_bytes)
-                lost   = int(stats.lost_pictures)
-                bps_from_vlc = float(stats.input_bitrate) * 8_000_000.0
+                rbytes      = int(stats.read_bytes)
+                dmx_rbytes  = int(stats.demux_read_bytes)
+                lost        = int(stats.lost_pictures)
+
+                # Try every bitrate source VLC offers, in order of
+                # reliability.  On some macOS RTSP-TCP builds only
+                # demux_bitrate works; on others only input_bitrate.
+                bps_input = float(stats.input_bitrate) * 8_000_000.0
+                bps_demux = float(stats.demux_bitrate) * 8_000_000.0
 
                 if self._last_stats_ts > 0.0:
                     dt = now - self._last_stats_ts
@@ -660,23 +645,36 @@ class PlayerPane(QWidget):
                         dl_raw = lost - self._last_lost_pictures
                         dl = dl_raw if 0 <= dl_raw < 1_000_000 else 0
 
-                        if bps_from_vlc > 0:
-                            bps = bps_from_vlc
+                        if bps_input > 0:
+                            bps = bps_input
+                        elif bps_demux > 0:
+                            bps = bps_demux
                         else:
-                            db_raw = rbytes - self._last_read_bytes
-                            if 0 <= db_raw < (1 << 30):
-                                bps = db_raw * 8.0 / dt
-                            # else leave bps at previous value (wrap)
+                            # Fallback: demux_read_bytes delta (less
+                            # prone to int32 overflow than read_bytes
+                            # on typical RTSP substreams).
+                            db = dmx_rbytes - self._last_read_bytes
+                            if 0 <= db < (1 << 30):
+                                bps = db * 8.0 / dt
+                            else:
+                                # last resort: read_bytes delta
+                                db2 = rbytes - self._last_read_bytes
+                                if 0 <= db2 < (1 << 30):
+                                    bps = db2 * 8.0 / dt
 
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug(
-                        "pane %d stats: decoded=%d read_bytes=%d lost=%d "
-                        "input_bitrate=%.6f -> fps(evt)=%.1f bps=%.0f",
-                        self.pane_id, int(stats.decoded_video), rbytes, lost,
-                        float(stats.input_bitrate), fps, bps,
+                        "pane %d stats: decoded=%d read=%d dmx_read=%d lost=%d "
+                        "input_br=%.6f dmx_br=%.6f -> fps=%.1f bps=%.0f",
+                        self.pane_id, int(stats.decoded_video), rbytes,
+                        dmx_rbytes, lost,
+                        float(stats.input_bitrate), float(stats.demux_bitrate),
+                        fps, bps,
                     )
 
-                self._last_read_bytes = rbytes
+                # Store the demux counter as _last_read_bytes so the
+                # fallback delta works for demux_read_bytes too.
+                self._last_read_bytes = dmx_rbytes if dmx_rbytes > 0 else rbytes
                 self._last_lost_pictures = lost
                 self._last_decoded_video = int(stats.decoded_video)
 
@@ -687,12 +685,6 @@ class PlayerPane(QWidget):
         self._last_stats_ts = now
 
         # ---- throughput pulse: stall detection ----
-        # A stream is "alive" if ANY of {time_events, decoded_video,
-        # lost_pictures} changed since the last tick.  We track a rolling
-        # window of alive/dead booleans (1 per second).  Only if the
-        # entire window is dead (ALL signals frozen for stall_window_s
-        # consecutive seconds) do we force a reconnect.
-        # Set stall_window_s = 0 in rtsp.ini to disable entirely.
         stall_win = self.cfg.stall_window_s
         if self._is_playing and stall_win > 0:
             cur_tec     = self._time_event_count
@@ -721,22 +713,37 @@ class PlayerPane(QWidget):
                 self._throughput_window.clear()
                 self._is_playing = False
                 self._schedule_retry("throughput-zero")
-                return  # skip overlay update this tick
+                return
 
-        # Always render once we have a playing player + assigned channel.
-        # Show dashes for values that are still zero so the user can see
-        # the overlay came up, and which field is missing.
-        fps_txt = f"{fps:>4.0f} fps" if fps > 0 else "  -- fps"
-        bps_txt = self._format_rate(bps) if bps > 0 else " -- bps"
-        if dl > 0:
-            text = f"{fps_txt}\n{bps_txt}\nlost {dl}"
-        else:
-            text = f"{fps_txt}\n{bps_txt}"
-        self.fps_label.setText(text)
-        self.fps_label.adjustSize()
-        if not self.fps_label.isVisible():
-            self.fps_label.show()
-            self.fps_label.raise_()
+        # ---- VLC marquee overlay (renders inside the video output) ----
+        # Qt QLabel overlays are hidden behind VLC's Metal/CoreGraphics
+        # layer on macOS, so we use libVLC's built-in marquee which draws
+        # directly into the video frame — always visible, any platform.
+        if self.player is not None and self._is_playing:
+            if not self._marquee_enabled:
+                try:
+                    p = self.player
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Enable, 1)
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Size, 14)
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Color, 0x00FF00)
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Opacity, 220)
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Position, 5)
+                    p.video_set_marquee_int(vlc.VideoMarqueeOption.Timeout, 0)
+                    self._marquee_enabled = True
+                except Exception:
+                    pass
+
+            if self._marquee_enabled:
+                fps_txt = f"{fps:.0f} fps" if fps > 0 else "-- fps"
+                bps_txt = self._format_rate(bps) if bps > 0 else "-- bps"
+                parts = [fps_txt, bps_txt]
+                if dl > 0:
+                    parts.append(f"lost {dl}")
+                try:
+                    self.player.video_set_marquee_string(
+                        vlc.VideoMarqueeOption.Text, "  ".join(parts))
+                except Exception:
+                    pass
 
     def shutdown(self):
         self._cancel_retry()
@@ -880,6 +887,7 @@ class MainWindow(QMainWindow):
             "--quiet",
             "--verbose=0",
             "--no-video-title-show",
+            "--sub-source=marq",
         ]
         if self.cfg.tcp:
             vlc_args.append("--rtsp-tcp")
