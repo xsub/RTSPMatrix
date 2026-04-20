@@ -832,17 +832,30 @@ class AboutDialog(QDialog):
         v.setContentsMargins(24, 20, 24, 16)
         v.setSpacing(0)
 
-        # ---- Puffy Clouds branding ----
-        logo_path = _find_logo(ABOUT_LOGO)
-        if logo_path:
-            pm = QPixmap(logo_path)
+        # ---- RTSPMatrix logo (main branding, dark background) ----
+        rtsp_logo = _find_logo("RTSPMatrix_logo.png")
+        if rtsp_logo:
+            pm = QPixmap(rtsp_logo)
             if not pm.isNull():
-                scaled = pm.scaledToWidth(320, Qt.SmoothTransformation)
-                logo_lbl = QLabel(self)
-                logo_lbl.setPixmap(scaled)
-                logo_lbl.setAlignment(Qt.AlignCenter)
-                v.addWidget(logo_lbl, 0, Qt.AlignCenter)
-                v.addSpacing(6)
+                scaled = pm.scaledToWidth(480, Qt.SmoothTransformation)
+                lbl = QLabel(self)
+                lbl.setPixmap(scaled)
+                lbl.setAlignment(Qt.AlignCenter)
+                v.addWidget(lbl, 0, Qt.AlignCenter)
+                v.addSpacing(10)
+
+        # ---- Puffy Clouds logo (company branding) ----
+        pc_logo = _find_logo(ABOUT_LOGO)
+        if pc_logo:
+            pm = QPixmap(pc_logo)
+            if not pm.isNull():
+                scaled = pm.scaledToWidth(200, Qt.SmoothTransformation)
+                lbl = QLabel(self)
+                lbl.setPixmap(scaled)
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet("background: white; padding: 8px 16px; border-radius: 6px;")
+                v.addWidget(lbl, 0, Qt.AlignCenter)
+                v.addSpacing(10)
 
         # ---- app name + tagline ----
         title = QLabel(
